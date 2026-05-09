@@ -1,0 +1,8 @@
+backend/__pycache__/
+backend/.venv/
+backend/*.log
+
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
