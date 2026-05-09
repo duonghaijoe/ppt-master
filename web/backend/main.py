@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -56,6 +56,10 @@ class UrlImportBody(BaseModel):
     url: str
 
 
+class AttachSessionBody(BaseModel):
+    name: str
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True, "repo_root": str(REPO_ROOT)}
@@ -93,11 +97,11 @@ async def create_session(body: CreateSessionBody):
 
 
 @app.post("/api/sessions/attach")
-async def attach_session(name: str = Form(...)):
+async def attach_session(body: AttachSessionBody):
     """Attach a session to an existing project (no init)."""
-    proj = project_path(name)
+    proj = project_path(body.name)
     if not proj.exists():
-        raise HTTPException(status_code=404, detail=f"project not found: {name}")
+        raise HTTPException(status_code=404, detail=f"project not found: {body.name}")
     session = await registry.create(proj)
     return {"session_id": session.id, "project": proj.name}
 
