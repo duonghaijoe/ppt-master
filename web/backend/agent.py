@@ -9,12 +9,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from claude_agent_sdk import (
+
+# Strip API-key env vars *before* importing the SDK so the spawned `claude`
+# subprocess inherits only the host's `claude /login` subscription credentials.
+# The SDK merges options.env on top of os.environ — it can add keys but not
+# remove them — so we have to clear them here, in the backend's own process.
+for _key in ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+    os.environ.pop(_key, None)
+
+
+from claude_agent_sdk import (  # noqa: E402
     ClaudeAgentOptions,
     ClaudeSDKClient,
 )
