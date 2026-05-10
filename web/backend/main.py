@@ -14,7 +14,7 @@ from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -25,13 +25,16 @@ from files import (
     project_path,
     list_slides,
     list_exports,
+    list_recent,
     list_tree,
+    deck_summary,
     safe_rel,
     init_project,
     import_source,
     import_url,
     watch_project,
 )
+from svg_inline import fold_icons, inline_icons
 
 
 app = FastAPI(title="Awesome Deck — AI-powered presentations", version="0.1.0")
@@ -300,6 +303,26 @@ def exports(name: str):
     return {"project": name, "exports": list_exports(name)}
 
 
+@app.get("/api/projects/{name}/recent")
+def recent(name: str, limit: int = 20):
+    """Workbench feed: recent artifacts in this project, newest first.
+
+    Returns a separate `deck` summary so the UI can offer the rendered slide
+    deck as a single virtual entry instead of N individual SVGs.
+    """
+    if not project_path(name).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    if limit < 1:
+        limit = 1
+    if limit > 100:
+        limit = 100
+    return {
+        "project": name,
+        "deck": deck_summary(name),
+        "recent": list_recent(name, limit=limit),
+    }
+
+
 @app.get("/api/projects/{name}/tree")
 def project_tree(name: str, path: str = ""):
     if not project_path(name).exists():
@@ -322,6 +345,43 @@ def project_file(name: str, path: str):
         raise HTTPException(status_code=400, detail="invalid path")
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not found")
+    if target.suffix.lower() == ".svg":
+        # Mirror /svg/{filename}: expand <use data-icon> placeholders so the
+        # browser preview matches the post-export PPTX rendering instead of
+        # showing empty circles where icons should be.
+        try:
+            body = inline_icons(target.read_text(encoding="utf-8"))
+        except Exception:
+            return FileResponse(target, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+        return Response(content=body, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+    return FileResponse(target, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/projects/{name}/web/{path:path}")
+def project_web(name: str, path: str):
+    """Path-style file server for web previews.
+
+    The query-string-based /file endpoint can't host HTML composites: a
+    `<img src="./foo.png">` inside an iframe at `/file?path=report.html`
+    resolves to `/foo.png`, not `/file?path=foo.png`. Serving the same
+    files under a clean path lets relative URLs resolve naturally inside
+    the project, so HTML artifacts with sibling assets render in the
+    workbench iframe.
+    """
+    if not project_path(name).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        target = safe_rel(name, path)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    if target.suffix.lower() == ".svg":
+        try:
+            body = inline_icons(target.read_text(encoding="utf-8"))
+        except Exception:
+            return FileResponse(target, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+        return Response(content=body, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
     return FileResponse(target, headers={"Cache-Control": "no-store"})
 
 
@@ -343,7 +403,19 @@ def serve_svg(name: str, filename: str):
     path = project_path(name) / "svg_output" / filename
     if not path.exists():
         raise HTTPException(status_code=404, detail="not found")
-    return FileResponse(path, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+    # Expand <use data-icon="…"/> placeholders so the browser can render
+    # icons. The source file is untouched — the export pipeline does its
+    # own expansion when producing PPTX.
+    raw = path.read_text(encoding="utf-8")
+    try:
+        body = inline_icons(raw)
+    except Exception:
+        body = raw
+    return Response(
+        content=body,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/api/projects/{name}/svg/{filename}")
@@ -366,6 +438,13 @@ def save_svg(name: str, filename: str, body: SvgSaveBody):
     head = text.lstrip()[:200].lower()
     if "<svg" not in head:
         raise HTTPException(status_code=400, detail="not an SVG document")
+    # Restore <use data-icon="…"/> placeholders. The GET endpoint expands
+    # them so the browser can render real geometry; without this fold, an
+    # editor save would persist the expansion and lose the abstraction.
+    try:
+        text = fold_icons(text)
+    except Exception:
+        pass
     target.write_text(text, encoding="utf-8")
     return {"ok": True, "bytes": len(text.encode("utf-8"))}
 

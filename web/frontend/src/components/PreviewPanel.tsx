@@ -1,8 +1,8 @@
 import { useState } from "react";
-import { SlideDeck } from "./SlideDeck";
+import { Workbench } from "./Workbench";
 import { ProjectFiles } from "./ProjectFiles";
 
-type Tab = "slides" | "files";
+type Tab = "workbench" | "files";
 
 export function PreviewPanel({
   project,
@@ -11,13 +11,13 @@ export function PreviewPanel({
   project: string;
   onAskAi?: (text: string) => void;
 }) {
-  const [tab, setTab] = useState<Tab>("slides");
+  const [tab, setTab] = useState<Tab>("workbench");
 
   return (
     <div className="h-full flex flex-col">
       <div className="border-b border-gray-200 bg-white px-3 pt-2 flex items-end gap-1">
-        <TabButton active={tab === "slides"} onClick={() => setTab("slides")}>
-          Slides
+        <TabButton active={tab === "workbench"} onClick={() => setTab("workbench")}>
+          Workbench
         </TabButton>
         <TabButton active={tab === "files"} onClick={() => setTab("files")}>
           Project files
@@ -27,8 +27,8 @@ export function PreviewPanel({
         </div>
       </div>
       <div className="flex-1 min-h-0">
-        {tab === "slides" ? (
-          <SlideDeck project={project} onAskAi={onAskAi} />
+        {tab === "workbench" ? (
+          <Workbench project={project} onAskAi={onAskAi} />
         ) : (
           <ProjectFiles project={project} onAskAi={onAskAi} />
         )}

@@ -23,10 +23,14 @@ type ModelTier = "auto" | "light" | "general" | "premium";
 
 type ComposeRequest = { text: string; nonce: number };
 
+type ProjectRef = { name: string; slides?: number; mtime?: number };
+
 type Props = {
   sessionId: string;
   permissionMode: PermissionMode;
   modelTier: ModelTier;
+  currentProject: string;
+  projects: ProjectRef[];
   onChangeMode: (m: PermissionMode) => void;
   onChangeTier: (t: ModelTier) => void;
   composeRequest?: ComposeRequest | null;
@@ -46,6 +50,8 @@ export function ChatPanel({
   sessionId,
   permissionMode,
   modelTier,
+  currentProject,
+  projects,
   onChangeMode,
   onChangeTier,
   composeRequest,
@@ -61,6 +67,11 @@ export function ChatPanel({
   const [showUrl, setShowUrl] = useState(false);
   const [urlValue, setUrlValue] = useState("");
   const [urlBusy, setUrlBusy] = useState(false);
+  const [showRefs, setShowRefs] = useState(false);
+  const [refSearch, setRefSearch] = useState("");
+  // Names of sibling projects the user has chosen to reference for design
+  // patterns / inspiration. Cleared on send (one-shot, like attachments).
+  const [refs, setRefs] = useState<string[]>([]);
   // Pending requests the user typed while the agent was still streaming.
   // Drained automatically (one per turn) once `streaming` flips false.
   const [queue, setQueue] = useState<string[]>([]);
@@ -70,6 +81,7 @@ export function ChatPanel({
   const settingsRef = useRef<HTMLDivElement>(null);
   const tierRef = useRef<HTMLDivElement>(null);
   const urlRef = useRef<HTMLDivElement>(null);
+  const refsRef = useRef<HTMLDivElement>(null);
   // Auto-scroll plumbing. We pin to the bottom while the user is "near the
   // bottom" — if they scroll up to read history, we stop following so we
   // don't yank them away from what they're reading.
@@ -124,7 +136,7 @@ export function ChatPanel({
 
   // Click-outside dismiss for the popovers.
   useEffect(() => {
-    if (!showSettings && !showTier && !showUrl) return;
+    if (!showSettings && !showTier && !showUrl && !showRefs) return;
     function onDoc(e: MouseEvent) {
       const t = e.target as Node;
       if (showSettings && settingsRef.current && !settingsRef.current.contains(t)) {
@@ -136,10 +148,13 @@ export function ChatPanel({
       if (showUrl && urlRef.current && !urlRef.current.contains(t)) {
         setShowUrl(false);
       }
+      if (showRefs && refsRef.current && !refsRef.current.contains(t)) {
+        setShowRefs(false);
+      }
     }
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
-  }, [showSettings, showTier, showUrl]);
+  }, [showSettings, showTier, showUrl, showRefs]);
 
   function queueAttached(files: { file: File; relpath: string }[]) {
     if (files.length === 0) return;
@@ -235,14 +250,26 @@ export function ChatPanel({
   // Build the final outbound message (uploads → "Attached:…" preface + text)
   // and dispatch via `send`. Hoisted out of submit() so the queue drain
   // effect can reuse the same path without going through the form handler.
-  async function dispatchMessage(text: string, queuedAttachments: AttachedFile[]) {
+  async function dispatchMessage(
+    text: string,
+    queuedAttachments: AttachedFile[],
+    queuedRefs: string[],
+  ) {
     let preface = "";
+    if (queuedRefs.length > 0) {
+      preface +=
+        "References (read-only — sibling projects you may consult for design " +
+        "patterns / inspiration; do not edit anything outside the active " +
+        "project):\n" +
+        queuedRefs.map((n) => `- ../${n}/`).join("\n") +
+        "\n\n";
+    }
     if (queuedAttachments.length > 0) {
       const results = await uploadFiles(queuedAttachments);
       const ok = results.filter((r) => r.status === "done");
       const bad = results.filter((r) => r.status === "error");
       if (ok.length > 0) {
-        preface =
+        preface +=
           `Attached ${ok.length} file${ok.length > 1 ? "s" : ""}:\n` +
           ok.map((u) => `- ${u.imported}`).join("\n") +
           (bad.length > 0
@@ -250,7 +277,7 @@ export function ChatPanel({
             : "") +
           "\n\n";
       } else if (bad.length > 0) {
-        preface = `Upload failed: ${bad.map((u) => `${u.name} (${u.error})`).join(", ")}\n\n`;
+        preface += `Upload failed: ${bad.map((u) => `${u.name} (${u.error})`).join(", ")}\n\n`;
       }
     }
     const composed = (preface + text).trim();
@@ -268,23 +295,23 @@ export function ChatPanel({
     atBottomRef.current = true;
 
     const queuedAttachments = attached;
+    const queuedRefs = refs;
     setAttached([]);
+    setRefs([]);
     setInput("");
 
     if (streaming) {
       // Claude-CLI-style queueing: keep the input flow free, drain when
-      // the current turn finishes. Attachments only ride along with the
-      // FIRST queued message — chaining attachments per item would be
-      // confusing (the user uploaded them once).
-      if (queuedAttachments.length > 0) {
-        // Re-stash so the next message picks them up before being sent.
-        setAttached(queuedAttachments);
-      }
+      // the current turn finishes. Attachments and refs only ride along
+      // with the FIRST queued message — chaining them per queued item
+      // would be confusing (the user picked them once).
+      if (queuedAttachments.length > 0) setAttached(queuedAttachments);
+      if (queuedRefs.length > 0) setRefs(queuedRefs);
       setQueue((q) => [...q, text]);
       return;
     }
 
-    void dispatchMessage(text, queuedAttachments);
+    void dispatchMessage(text, queuedAttachments, queuedRefs);
   }
 
   // Drain the queue once the current turn finishes. We pull one item per
@@ -296,8 +323,10 @@ export function ChatPanel({
     const [next, ...rest] = queue;
     setQueue(rest);
     const carriedAttachments = attached;
+    const carriedRefs = refs;
     setAttached([]);
-    void dispatchMessage(next, carriedAttachments);
+    setRefs([]);
+    void dispatchMessage(next, carriedAttachments, carriedRefs);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [streaming, queue]);
 
@@ -585,6 +614,29 @@ export function ChatPanel({
             </div>
           )}
 
+          {refs.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 px-3 pt-2.5">
+              {refs.map((name) => (
+                <span
+                  key={`ref-${name}`}
+                  className="inline-flex items-center gap-1.5 text-[11px] bg-sky-50 border border-sky-200 text-sky-800 rounded px-2 py-0.5 max-w-full"
+                  title={`Reference project: ${name}`}
+                >
+                  <LinkIcon />
+                  <span className="truncate max-w-[200px]">{name}</span>
+                  <button
+                    type="button"
+                    onClick={() => setRefs((cur) => cur.filter((n) => n !== name))}
+                    className="text-sky-600/70 hover:text-brand-red"
+                    title="Remove reference"
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+
           <textarea
             ref={taRef}
             value={input}
@@ -704,6 +756,113 @@ export function ChatPanel({
                 <FolderIcon />
               </ToolbarIconButton>
 
+              {/* Reference another project (read-only inspiration) */}
+              <div className="relative" ref={refsRef}>
+                <ToolbarIconButton
+                  title="Reference another project for design patterns / inspiration"
+                  onClick={() => {
+                    setShowSettings(false);
+                    setShowTier(false);
+                    setShowUrl(false);
+                    setShowRefs((v) => !v);
+                  }}
+                  active={showRefs}
+                >
+                  <LinkIcon />
+                  {refs.length > 0 && (
+                    <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] px-1 rounded-full bg-sky-500 text-white text-[9px] leading-[14px] text-center">
+                      {refs.length}
+                    </span>
+                  )}
+                </ToolbarIconButton>
+                {showRefs && (
+                  <div className="absolute bottom-full mb-2 left-0 z-20 w-80 bg-white border border-gray-200 rounded-lg shadow-lg p-2 text-xs space-y-2">
+                    <div className="text-[10px] uppercase tracking-wider text-gray-400 px-1">
+                      Reference another project
+                    </div>
+                    <input
+                      autoFocus
+                      value={refSearch}
+                      onChange={(e) => setRefSearch(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") setShowRefs(false);
+                      }}
+                      placeholder="Search projects…"
+                      className="w-full border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:border-brand-green"
+                    />
+                    <div className="max-h-56 overflow-y-auto -mx-1 px-1">
+                      {(() => {
+                        const q = refSearch.trim().toLowerCase();
+                        const others = projects
+                          .filter((p) => p.name !== currentProject)
+                          .filter((p) => !q || p.name.toLowerCase().includes(q))
+                          .slice()
+                          .sort((a, b) => (b.mtime ?? 0) - (a.mtime ?? 0));
+                        if (others.length === 0) {
+                          return (
+                            <div className="text-[11px] text-gray-400 italic px-2 py-3 text-center">
+                              {q
+                                ? `No projects match "${refSearch}".`
+                                : "No other projects to reference yet."}
+                            </div>
+                          );
+                        }
+                        return others.map((p) => {
+                          const picked = refs.includes(p.name);
+                          return (
+                            <button
+                              key={p.name}
+                              type="button"
+                              onClick={() => {
+                                setRefs((cur) =>
+                                  picked
+                                    ? cur.filter((n) => n !== p.name)
+                                    : [...cur, p.name],
+                                );
+                              }}
+                              className={`w-full text-left flex items-center gap-2 px-2 py-1.5 rounded hover:bg-gray-50 ${
+                                picked ? "bg-sky-50/60" : ""
+                              }`}
+                            >
+                              <span
+                                className={`w-3.5 h-3.5 rounded border flex items-center justify-center shrink-0 ${
+                                  picked
+                                    ? "bg-sky-500 border-sky-500 text-white"
+                                    : "border-gray-300"
+                                }`}
+                              >
+                                {picked && (
+                                  <svg viewBox="0 0 16 16" className="w-2.5 h-2.5" fill="none">
+                                    <path
+                                      d="M3 8.5l3 3 7-7"
+                                      stroke="currentColor"
+                                      strokeWidth="2"
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                    />
+                                  </svg>
+                                )}
+                              </span>
+                              <span className="truncate flex-1">{p.name}</span>
+                              {typeof p.slides === "number" && p.slides > 0 && (
+                                <span className="text-[10px] text-gray-400 shrink-0">
+                                  {p.slides} slides
+                                </span>
+                              )}
+                            </button>
+                          );
+                        });
+                      })()}
+                    </div>
+                    <div className="text-[10px] text-gray-400 px-1 leading-snug">
+                      The agent gets read-only paths like{" "}
+                      <span className="font-mono">../&lt;name&gt;/</span>. It won't
+                      edit anything outside the active project.
+                    </div>
+                  </div>
+                )}
+              </div>
+
               {/* Import URL */}
               <div className="relative" ref={urlRef}>
                 <button
@@ -763,31 +922,34 @@ export function ChatPanel({
 
             {(() => {
               const hasInput = !!input.trim() || attached.length > 0;
-              if (streaming && !hasInput) {
-                // Stop the in-flight turn entirely.
+              if (streaming) {
+                // Stop is always available while the agent is working — even
+                // when the user has queued more (or has stashed attachments
+                // riding along with a queued item). Without this, queueing a
+                // message with attachments would leave the user no way to
+                // interrupt until the queue drained.
                 return (
-                  <button
-                    type="button"
-                    onClick={() => interrupt()}
-                    title="Stop generating"
-                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-gray-800 text-white rounded-md text-sm hover:bg-black"
-                  >
-                    <StopIcon />
-                    Stop
-                  </button>
-                );
-              }
-              if (streaming && hasInput) {
-                // Don't interrupt — just queue the next request.
-                return (
-                  <button
-                    type="submit"
-                    title="Queue this message — will run after the current turn"
-                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-amber-500 text-white rounded-md text-sm hover:bg-amber-600"
-                  >
-                    <SendIcon />
-                    Queue
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => interrupt()}
+                      title="Stop generating"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-gray-800 text-white rounded-md text-sm hover:bg-black"
+                    >
+                      <StopIcon />
+                      Stop
+                    </button>
+                    {hasInput && (
+                      <button
+                        type="submit"
+                        title="Queue this message — will run after the current turn"
+                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-amber-500 text-white rounded-md text-sm hover:bg-amber-600"
+                      >
+                        <SendIcon />
+                        Queue
+                      </button>
+                    )}
+                  </div>
                 );
               }
               return (
@@ -939,6 +1101,15 @@ function SparkIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M12 3v3M12 18v3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M3 12h3M18 12h3M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1" />
+    </svg>
+  );
+}
+
+function LinkIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 1 0-7.07-7.07l-1.5 1.5" />
+      <path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 1 0 7.07 7.07l1.5-1.5" />
     </svg>
   );
 }

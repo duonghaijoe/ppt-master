@@ -41,14 +41,14 @@ export function App() {
   const [threads, setThreads] = useState<ThreadEntry[]>([]);
   const [hydrated, setHydrated] = useState<{ events: ReturnType<typeof loadThreadEvents>; nonce: number } | null>(null);
 
-  // Refresh project list whenever we land on the dashboard.
+  // Refresh project list whenever the dashboard mounts AND whenever a session
+  // opens (so the in-chat "reference another project" picker stays fresh).
   useEffect(() => {
-    if (session) return;
     fetch("/api/projects")
       .then((r) => r.json())
       .then((d) => setExisting(d.projects ?? []))
       .catch(() => setExisting([]));
-  }, [session]);
+  }, [session?.project]);
 
   async function createProject(name: string, format: Format) {
     setCreating(true);
@@ -252,6 +252,7 @@ export function App() {
       seedEvents={hydrated?.events ?? []}
       threads={threads}
       threadId={threadId}
+      projects={existing}
       onPermissionChange={changeMode}
       onTierChange={changeTier}
       onSwitchProject={exitSession}
@@ -282,6 +283,7 @@ function SessionShell({
   seedEvents,
   threads,
   threadId,
+  projects,
   onPermissionChange,
   onTierChange,
   onSwitchProject,
@@ -293,6 +295,7 @@ function SessionShell({
   seedEvents: ReturnType<typeof loadThreadEvents>;
   threads: ThreadEntry[];
   threadId: string | null;
+  projects: ProjectMeta[];
   onPermissionChange: (m: PermissionMode) => void;
   onTierChange: (t: ModelTier) => void;
   onSwitchProject: () => void;
@@ -346,6 +349,8 @@ function SessionShell({
             sessionId={session.session_id}
             permissionMode={session.permission_mode}
             modelTier={session.model_tier}
+            currentProject={session.project}
+            projects={projects}
             onChangeMode={onPermissionChange}
             onChangeTier={onTierChange}
             composeRequest={composeReq}

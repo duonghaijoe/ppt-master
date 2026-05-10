@@ -38,6 +38,23 @@ def safe_rel(name: str, rel: str) -> Path:
 
 _HIDDEN = {".DS_Store"}
 
+# Directories that should never appear in workbench/event streams. Sources are
+# user inputs, not artifacts; the rest are tooling noise.
+_NOISE_DIRS = {
+    "sources",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    ".git",
+    ".idea",
+    ".vscode",
+    ".pytest_cache",
+}
+
+
+def _is_noise(rel: Path) -> bool:
+    return any(part.startswith(".") or part in _NOISE_DIRS for part in rel.parts)
+
 
 def list_tree(name: str, rel: str = "") -> dict:
     target = safe_rel(name, rel)
@@ -78,6 +95,52 @@ def list_slides(name: str) -> list[dict]:
             "mtime": int(svg.stat().st_mtime),
         })
     return out
+
+
+def list_recent(name: str, limit: int = 20) -> list[dict]:
+    """Recent artifact files in a project, newest first.
+
+    Excludes input materials (sources/), tooling noise (.git, node_modules, …),
+    hidden files, and the rendered slide deck under svg_output/ (those are
+    aggregated as a single 'Slide deck' workbench entry on the frontend).
+    """
+    base = project_path(name)
+    if not base.exists():
+        return []
+    items: list[dict] = []
+    for p in base.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            rel = p.relative_to(base)
+        except ValueError:
+            continue
+        if _is_noise(rel):
+            continue
+        if p.name in _HIDDEN:
+            continue
+        if rel.parts and rel.parts[0] == "svg_output":
+            continue
+        st = p.stat()
+        items.append({
+            "path": str(rel),
+            "name": p.name,
+            "size": st.st_size,
+            "mtime": int(st.st_mtime),
+        })
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return items[:limit]
+
+
+def deck_summary(name: str) -> dict | None:
+    """Aggregate metadata for the rendered slide deck, or None if empty."""
+    slides = list_slides(name)
+    if not slides:
+        return None
+    return {
+        "count": len(slides),
+        "mtime": max(s["mtime"] for s in slides),
+    }
 
 
 def list_exports(name: str) -> list[dict]:
@@ -189,12 +252,24 @@ def import_url(project_dir: Path, url: str) -> Path:
 
 
 async def watch_project(project_dir: Path, stop_event: asyncio.Event) -> AsyncIterator[dict]:
-    """Yield filesystem events for svg_output/ and exports/ until stop_event is set."""
-    targets = [project_dir / "svg_output", project_dir / "exports"]
-    targets = [t for t in targets if t.exists()] or [project_dir]
-    async for changes in awatch(*[str(t) for t in targets], stop_event=stop_event, recursive=True):
+    """Yield filesystem events for the whole project, minus tooling noise.
+
+    The workbench needs to react to any artifact change — flashcards, single
+    SVGs, markdown drops — not just slides under svg_output/. Hidden dirs,
+    sources/ inputs, and tooling caches are filtered out so we don't flood
+    the SSE stream.
+    """
+    async for changes in awatch(str(project_dir), stop_event=stop_event, recursive=True):
         for change, path in changes:
+            try:
+                rel = Path(path).relative_to(project_dir)
+            except ValueError:
+                continue
+            if _is_noise(rel):
+                continue
+            if Path(path).name in _HIDDEN:
+                continue
             yield {
                 "kind": Change(change).name.lower(),
-                "path": str(Path(path).relative_to(project_dir)),
+                "path": str(rel),
             }
