@@ -1,37 +1,77 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChatPanel } from "./components/ChatPanel";
-import { SlideDeck } from "./components/SlideDeck";
-import { ImportDropzone } from "./components/ImportDropzone";
+import { PreviewPanel } from "./components/PreviewPanel";
+import { Dashboard } from "./components/Dashboard";
+import { ProjectHeader, type ThreadEntry } from "./components/ProjectHeader";
+import { SessionProvider } from "./SessionContext";
+import { useAgentStream } from "./hooks/useAgentStream";
+import {
+  deriveTitle,
+  loadThreadEvents,
+  loadThreads,
+  newThreadId,
+  saveThreadEvents,
+  upsertThread,
+  type ThreadMeta,
+} from "./threads";
+
+type PermissionMode = "auto" | "confirm";
+type ModelTier = "auto" | "light" | "general" | "premium";
+type Format = "ppt169" | "ppt43" | "a4portrait";
 
 type SessionInfo = {
   session_id: string;
   project: string;
+  permission_mode: PermissionMode;
+  model_tier: ModelTier;
 };
+
+type ProjectMeta = { name: string; slides: number; exports?: number; mtime?: number };
 
 export function App() {
   const [session, setSession] = useState<SessionInfo | null>(null);
-  const [projectName, setProjectName] = useState("");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [existing, setExisting] = useState<{ name: string; slides: number }[]>([]);
+  const [existing, setExisting] = useState<ProjectMeta[]>([]);
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>("auto");
+  const [modelTier, setModelTier] = useState<ModelTier>("auto");
 
+  // Thread state — only meaningful while a session is active.
+  const [threadId, setThreadId] = useState<string | null>(null);
+  const [threads, setThreads] = useState<ThreadEntry[]>([]);
+  const [hydrated, setHydrated] = useState<{ events: ReturnType<typeof loadThreadEvents>; nonce: number } | null>(null);
+
+  // Refresh project list whenever we land on the dashboard.
   useEffect(() => {
-    fetch("/api/projects").then((r) => r.json()).then((d) => setExisting(d.projects ?? []));
+    if (session) return;
+    fetch("/api/projects")
+      .then((r) => r.json())
+      .then((d) => setExisting(d.projects ?? []))
+      .catch(() => setExisting([]));
   }, [session]);
 
-  async function createProject() {
-    if (!projectName.trim()) return;
+  async function createProject(name: string, format: Format) {
     setCreating(true);
     setError(null);
     try {
       const res = await fetch("/api/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: projectName, format: "ppt169" }),
+        body: JSON.stringify({
+          name,
+          format,
+          permission_mode: permissionMode,
+          model_tier: modelTier,
+        }),
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
-      setSession({ session_id: data.session_id, project: data.project });
+      enterSession({
+        session_id: data.session_id,
+        project: data.project,
+        permission_mode: data.permission_mode ?? permissionMode,
+        model_tier: data.model_tier ?? modelTier,
+      });
     } catch (e: any) {
       setError(String(e.message || e));
     } finally {
@@ -41,89 +81,284 @@ export function App() {
 
   async function attach(name: string) {
     setError(null);
-    const fd = new FormData();
-    fd.append("name", name);
-    const res = await fetch("/api/sessions/attach", { method: "POST", body: fd });
-    if (!res.ok) {
-      setError(await res.text());
-      return;
+    try {
+      const res = await fetch("/api/sessions/attach", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          permission_mode: permissionMode,
+          model_tier: modelTier,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      enterSession({
+        session_id: data.session_id,
+        project: data.project,
+        permission_mode: data.permission_mode ?? permissionMode,
+        model_tier: data.model_tier ?? modelTier,
+      });
+    } catch (e: any) {
+      setError(String(e.message || e));
     }
-    const data = await res.json();
-    setSession({ session_id: data.session_id, project: data.project });
+  }
+
+  function enterSession(info: SessionInfo) {
+    setSession(info);
+    const list = loadThreads(info.project);
+    if (list.length > 0) {
+      const latest = list[0];
+      setThreadId(latest.id);
+      setThreads(toEntries(list, latest.id));
+      setHydrated({ events: loadThreadEvents(latest.id), nonce: Date.now() });
+    } else {
+      const id = newThreadId();
+      const meta: ThreadMeta = {
+        id,
+        project: info.project,
+        started: Date.now(),
+        lastUsed: Date.now(),
+        title: "Untitled chat",
+      };
+      upsertThread(meta);
+      setThreadId(id);
+      setThreads(toEntries(loadThreads(info.project), id));
+      setHydrated({ events: [], nonce: Date.now() });
+    }
+  }
+
+  async function changeMode(mode: PermissionMode) {
+    setPermissionMode(mode);
+    if (!session) return;
+    setSession({ ...session, permission_mode: mode });
+    try {
+      await fetch(`/api/sessions/${session.session_id}/permission_mode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+    } catch {
+      // best-effort
+    }
+  }
+
+  async function changeTier(tier: ModelTier) {
+    setModelTier(tier);
+    if (!session) return;
+    setSession({ ...session, model_tier: tier });
+    try {
+      await fetch(`/api/sessions/${session.session_id}/model_tier`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tier }),
+      });
+    } catch {
+      // best-effort — backend will pick up the new tier on next reconnect
+    }
+  }
+
+  async function newChat() {
+    if (!session) return;
+    const projectName = session.project;
+    try {
+      const res = await fetch("/api/sessions/attach", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: projectName,
+          permission_mode: permissionMode,
+          model_tier: modelTier,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      const id = newThreadId();
+      upsertThread({
+        id,
+        project: projectName,
+        started: Date.now(),
+        lastUsed: Date.now(),
+        title: "Untitled chat",
+      });
+      setThreadId(id);
+      setThreads(toEntries(loadThreads(projectName), id));
+      setHydrated({ events: [], nonce: Date.now() });
+      setSession({
+        session_id: data.session_id,
+        project: data.project,
+        permission_mode: data.permission_mode ?? permissionMode,
+        model_tier: data.model_tier ?? modelTier,
+      });
+    } catch (e: any) {
+      setError(String(e.message || e));
+    }
+  }
+
+  async function selectThread(id: string) {
+    if (!session) return;
+    if (id === threadId) return;
+    try {
+      const res = await fetch("/api/sessions/attach", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: session.project,
+          permission_mode: permissionMode,
+          model_tier: modelTier,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setThreadId(id);
+      setThreads(toEntries(loadThreads(session.project), id));
+      setHydrated({ events: loadThreadEvents(id), nonce: Date.now() });
+      setSession({
+        session_id: data.session_id,
+        project: data.project,
+        permission_mode: data.permission_mode ?? permissionMode,
+        model_tier: data.model_tier ?? modelTier,
+      });
+    } catch (e: any) {
+      setError(String(e.message || e));
+    }
+  }
+
+  function exitSession() {
+    setSession(null);
+    setThreadId(null);
+    setThreads([]);
+    setHydrated(null);
   }
 
   if (!session) {
     return (
-      <div className="h-full flex items-center justify-center p-6">
-        <div className="bg-white rounded-lg shadow-md p-8 w-full max-w-xl space-y-6">
-          <header>
-            <h1 className="text-2xl font-bold">PPT Master</h1>
-            <p className="text-sm text-gray-500">Chat-driven slide generation</p>
-          </header>
-
-          <section className="space-y-2">
-            <label className="text-sm font-medium">New project name</label>
-            <div className="flex gap-2">
-              <input
-                value={projectName}
-                onChange={(e) => setProjectName(e.target.value)}
-                placeholder="my_deck"
-                className="flex-1 border border-gray-300 rounded px-3 py-2 text-sm"
-              />
-              <button
-                onClick={createProject}
-                disabled={creating || !projectName.trim()}
-                className="px-4 py-2 bg-brand-green text-white rounded text-sm disabled:opacity-50"
-              >
-                {creating ? "Creating..." : "Create"}
-              </button>
-            </div>
-            {error && <div className="text-red-600 text-sm">{error}</div>}
-          </section>
-
-          {existing.length > 0 && (
-            <section>
-              <h2 className="text-sm font-medium mb-2">Existing projects</h2>
-              <ul className="border rounded divide-y">
-                {existing.map((p) => (
-                  <li key={p.name} className="flex items-center justify-between px-3 py-2 text-sm">
-                    <span>
-                      {p.name} <span className="text-gray-400">({p.slides} slides)</span>
-                    </span>
-                    <button onClick={() => attach(p.name)} className="text-brand-red hover:underline">
-                      Open
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
-        </div>
-      </div>
+      <Dashboard
+        existing={existing}
+        permissionMode={permissionMode}
+        onPermissionChange={setPermissionMode}
+        onCreate={createProject}
+        onOpen={attach}
+        creating={creating}
+        error={error}
+      />
     );
   }
 
   return (
-    <div className="h-full grid grid-cols-[400px_1fr]">
-      <aside className="bg-white border-r border-gray-200 flex flex-col">
-        <header className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
-          <div>
-            <div className="text-xs uppercase text-gray-400">Project</div>
-            <div className="font-mono text-sm">{session.project}</div>
-          </div>
-          <button
-            onClick={() => setSession(null)}
-            className="text-xs text-gray-500 hover:text-brand-red"
-          >
-            Switch
-          </button>
-        </header>
-        <ImportDropzone sessionId={session.session_id} />
-        <ChatPanel sessionId={session.session_id} />
-      </aside>
-      <main className="overflow-hidden">
-        <SlideDeck project={session.project} />
-      </main>
-    </div>
+    <SessionShell
+      key={hydrated?.nonce ?? "init"}
+      session={session}
+      seedEvents={hydrated?.events ?? []}
+      threads={threads}
+      threadId={threadId}
+      onPermissionChange={changeMode}
+      onTierChange={changeTier}
+      onSwitchProject={exitSession}
+      onNewChat={newChat}
+      onSelectThread={selectThread}
+      onTitleChange={(title, lastUsed) => {
+        if (!threadId) return;
+        const meta: ThreadMeta = {
+          id: threadId,
+          project: session.project,
+          started: threads.find((t) => t.id === threadId)?.started ?? Date.now(),
+          lastUsed,
+          title,
+        };
+        upsertThread(meta);
+        setThreads(toEntries(loadThreads(session.project), threadId));
+      }}
+    />
+  );
+}
+
+function toEntries(list: ThreadMeta[], activeId: string | null): ThreadEntry[] {
+  return list.map((t) => ({ ...t, active: t.id === activeId }));
+}
+
+function SessionShell({
+  session,
+  seedEvents,
+  threads,
+  threadId,
+  onPermissionChange,
+  onTierChange,
+  onSwitchProject,
+  onNewChat,
+  onSelectThread,
+  onTitleChange,
+}: {
+  session: SessionInfo;
+  seedEvents: ReturnType<typeof loadThreadEvents>;
+  threads: ThreadEntry[];
+  threadId: string | null;
+  onPermissionChange: (m: PermissionMode) => void;
+  onTierChange: (t: ModelTier) => void;
+  onSwitchProject: () => void;
+  onNewChat: () => void;
+  onSelectThread: (id: string) => void;
+  onTitleChange: (title: string, lastUsed: number) => void;
+}) {
+  const stream = useAgentStream(session.session_id);
+  const seededRef = useRef(false);
+  // SVG-editor → chat handoff. SlideEditor builds a context-rich draft when
+  // the user hits "Ask AI" on a selected element; ChatPanel watches the nonce
+  // and refills its textarea so the user can review and send.
+  const [composeReq, setComposeReq] = useState<{ text: string; nonce: number } | null>(null);
+
+  // Hydrate the agent stream's event list with whatever we restored from the
+  // selected thread's localStorage snapshot — runs once per remount.
+  useEffect(() => {
+    if (seededRef.current) return;
+    seededRef.current = true;
+    if (seedEvents.length > 0) stream.replaceEvents(seedEvents);
+  }, [seedEvents, stream]);
+
+  // Persist the live event log to the active thread on every change, and
+  // refresh the thread title from the first user message.
+  const lastTitleRef = useRef<string>("");
+  useEffect(() => {
+    if (!threadId) return;
+    saveThreadEvents(threadId, stream.events);
+    const title = deriveTitle(stream.events);
+    if (title && title !== lastTitleRef.current) {
+      lastTitleRef.current = title;
+      onTitleChange(title, Date.now());
+    }
+  }, [stream.events, threadId, onTitleChange]);
+
+  return (
+    <SessionProvider value={stream}>
+      <div className="h-full grid grid-cols-[400px_1fr] overflow-hidden">
+        <aside className="bg-white border-r border-gray-200 flex flex-col min-h-0 min-w-0">
+          <ProjectHeader
+            project={session.project}
+            threads={threads}
+            activeThreadId={threadId}
+            permissionMode={session.permission_mode}
+            onSwitchProject={onSwitchProject}
+            onNewChat={onNewChat}
+            onSelectThread={onSelectThread}
+            onPermissionChange={onPermissionChange}
+          />
+          <ChatPanel
+            sessionId={session.session_id}
+            permissionMode={session.permission_mode}
+            modelTier={session.model_tier}
+            onChangeMode={onPermissionChange}
+            onChangeTier={onTierChange}
+            composeRequest={composeReq}
+            onComposeConsumed={() => setComposeReq(null)}
+          />
+        </aside>
+        <main className="overflow-hidden min-h-0 min-w-0">
+          <PreviewPanel
+            project={session.project}
+            onAskAi={(text) => setComposeReq({ text, nonce: Date.now() })}
+          />
+        </main>
+      </div>
+    </SessionProvider>
   );
 }

@@ -26,6 +26,46 @@ def project_path(name: str) -> Path:
     return PROJECTS_DIR / safe
 
 
+def safe_rel(name: str, rel: str) -> Path:
+    """Resolve project_path(name) / rel, refusing path escape."""
+    base = project_path(name).resolve()
+    rel = (rel or "").lstrip("/")
+    target = (base / rel).resolve() if rel else base
+    if base != target and base not in target.parents:
+        raise ValueError("path escape")
+    return target
+
+
+_HIDDEN = {".DS_Store"}
+
+
+def list_tree(name: str, rel: str = "") -> dict:
+    target = safe_rel(name, rel)
+    if not target.exists():
+        raise FileNotFoundError(rel or "/")
+    if target.is_file():
+        st = target.stat()
+        return {
+            "type": "file",
+            "name": target.name,
+            "path": rel,
+            "size": st.st_size,
+            "mtime": int(st.st_mtime),
+        }
+    entries = []
+    for p in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+        if p.name in _HIDDEN or p.name.startswith("."):
+            continue
+        st = p.stat()
+        entries.append({
+            "name": p.name,
+            "is_dir": p.is_dir(),
+            "size": None if p.is_dir() else st.st_size,
+            "mtime": int(st.st_mtime),
+        })
+    return {"type": "dir", "path": rel, "entries": entries}
+
+
 def list_slides(name: str) -> list[dict]:
     p = project_path(name) / "svg_output"
     if not p.exists():
@@ -79,15 +119,50 @@ _IMPORT_SCRIPTS = {
     ".txt": None,
 }
 
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+
+
+def _safe_basename(name: str) -> str:
+    """Return a clean basename — strip directories and invalid chars."""
+    base = Path(name).name or "upload"
+    # Disallow leading dots so we don't write hidden files.
+    return base.lstrip(".") or "upload"
+
+
+def _unique_dest(folder: Path, name: str) -> Path:
+    """Return a non-clobbering destination path inside `folder`."""
+    folder.mkdir(parents=True, exist_ok=True)
+    base = _safe_basename(name)
+    target = folder / base
+    if not target.exists():
+        return target
+    stem, suffix = Path(base).stem, Path(base).suffix
+    i = 1
+    while True:
+        candidate = folder / f"{stem}_{i}{suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
 
 def import_source(project_dir: Path, upload_path: Path, original_name: str) -> Path:
-    """Place a user upload into the project sources/ folder, converting if needed."""
+    """Place a user upload into the project, routing by file type.
+
+    - Documents (pdf, docx, etc.) → sources/, converted to .md when possible.
+    - Images (png, jpg, svg, …)  → images/.
+    - Anything else              → sources/ as-is (no conversion).
+    """
+    suffix = Path(original_name).suffix.lower()
+
+    if suffix in _IMAGE_EXTS:
+        dest = _unique_dest(project_dir / "images", original_name)
+        shutil.move(str(upload_path), dest)
+        return dest
+
     sources = project_dir / "sources"
-    sources.mkdir(parents=True, exist_ok=True)
-    dest = sources / original_name
+    dest = _unique_dest(sources, original_name)
     shutil.move(str(upload_path), dest)
 
-    suffix = dest.suffix.lower()
     script = _IMPORT_SCRIPTS.get(suffix)
     if script is None:
         return dest

@@ -1,0 +1,121 @@
+import { useEffect, useRef, useState } from "react";
+import { ClockIcon, DeckIcon, PlusIcon } from "./Dashboard";
+
+export type ThreadEntry = {
+  id: string;
+  project: string;
+  started: number;
+  lastUsed: number;
+  title: string;
+  active?: boolean;
+};
+
+type PermissionMode = "auto" | "confirm";
+
+export function ProjectHeader({
+  project,
+  threads,
+  activeThreadId,
+  onSwitchProject,
+  onNewChat,
+  onSelectThread,
+}: {
+  project: string;
+  threads: ThreadEntry[];
+  activeThreadId: string | null;
+  permissionMode?: PermissionMode;
+  onSwitchProject: () => void;
+  onNewChat: () => void;
+  onSelectThread: (id: string) => void;
+  onPermissionChange?: (m: PermissionMode) => void;
+}) {
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!historyOpen) return;
+    function onDocClick(e: MouseEvent) {
+      if (!wrapRef.current?.contains(e.target as Node)) setHistoryOpen(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [historyOpen]);
+
+  return (
+    <header className="px-3 py-2 border-b border-gray-200 flex items-center gap-2">
+      <button
+        onClick={onSwitchProject}
+        title="Switch project · Awesome Deck"
+        className="w-11 h-11 flex items-center justify-center shrink-0 rounded-md hover:bg-gray-100 transition"
+      >
+        <DeckIcon className="w-11 h-11" />
+      </button>
+
+      <div className="font-medium text-sm truncate flex-1 min-w-0" title={project}>
+        {project}
+      </div>
+
+      <div className="relative shrink-0" ref={wrapRef}>
+        <button
+          onClick={() => setHistoryOpen((v) => !v)}
+          title="Chat history for this project"
+          className={`w-8 h-8 rounded-full flex items-center justify-center text-gray-500 hover:bg-gray-100 ${
+            historyOpen ? "bg-gray-100" : ""
+          }`}
+        >
+          <ClockIcon className="w-4 h-4" />
+        </button>
+        {historyOpen && (
+          <div className="absolute right-0 top-full mt-1 w-72 max-h-80 overflow-y-auto bg-white border border-gray-200 rounded-lg shadow-md z-30 py-1">
+            <div className="px-3 pt-2 pb-1 text-[11px] uppercase tracking-wider text-gray-400">
+              History · {project}
+            </div>
+            {threads.length === 0 && (
+              <div className="px-3 py-3 text-[12px] text-gray-500 italic">
+                No prior chats on this project yet.
+              </div>
+            )}
+            {threads.map((t) => {
+              const isActive = t.id === activeThreadId;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => {
+                    onSelectThread(t.id);
+                    setHistoryOpen(false);
+                  }}
+                  className={`w-full text-left px-3 py-2 text-[12px] hover:bg-gray-50 flex flex-col gap-0.5 ${
+                    isActive ? "bg-brand-green/5" : ""
+                  }`}
+                >
+                  <div className="font-medium truncate">{t.title || "Untitled chat"}</div>
+                  <div className="text-[10px] text-gray-500 flex justify-between">
+                    <span>{relTime(t.lastUsed)}</span>
+                    {isActive && <span className="text-brand-green">current</span>}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <button
+        onClick={onNewChat}
+        title="New chat on this project"
+        className="w-8 h-8 rounded-full flex items-center justify-center text-gray-500 hover:bg-gray-100 shrink-0"
+      >
+        <PlusIcon className="w-4 h-4" />
+      </button>
+    </header>
+  );
+}
+
+function relTime(ts: number) {
+  const delta = (Date.now() - ts) / 1000;
+  if (delta < 60) return "just now";
+  if (delta < 60 * 60) return `${Math.floor(delta / 60)}m ago`;
+  if (delta < 60 * 60 * 24) return `${Math.floor(delta / 3600)}h ago`;
+  if (delta < 60 * 60 * 24 * 7) return `${Math.floor(delta / 86400)}d ago`;
+  return new Date(ts).toLocaleDateString();
+}

@@ -45,7 +45,8 @@ description: >
 | Script | Purpose |
 |--------|---------|
 | `${SKILL_DIR}/scripts/source_to_md/pdf_to_md.py` | PDF to Markdown |
-| `${SKILL_DIR}/scripts/source_to_md/doc_to_md.py` | Documents to Markdown — native Python for DOCX/HTML/EPUB/IPYNB, pandoc fallback for legacy formats (.doc/.odt/.rtf/.tex/.rst/.org/.typ) |
+| `${SKILL_DIR}/scripts/source_to_md/doc_to_md.py` | Documents to Markdown — native Python for DOCX/HTML/EPUB/IPYNB, pandoc fallback for legacy formats (.doc/.odt/.rtf/.tex/.rst/.org/.typ); auto-detects bundler/SPA-style HTML and delegates to `html_bundler_extract.py` |
+| `${SKILL_DIR}/scripts/source_to_md/html_bundler_extract.py` | Unpacks Gamma / SPA-style single-file HTML exports — extracts `__bundler/manifest` assets (brand PNGs, JSX, fonts) and decodes the embedded template HTML to `*.real.html` |
 | `${SKILL_DIR}/scripts/source_to_md/excel_to_md.py` | Excel workbooks to Markdown — supports .xlsx/.xlsm; legacy .xls should be resaved as .xlsx |
 | `${SKILL_DIR}/scripts/source_to_md/ppt_to_md.py` | PowerPoint to Markdown |
 | `${SKILL_DIR}/scripts/source_to_md/web_to_md.py` | Web page to Markdown |
@@ -99,6 +100,7 @@ When the user provides non-Markdown content, convert immediately:
 | CSV / TSV | Read directly as plain-text table source |
 | PPTX / PowerPoint deck | `python3 ${SKILL_DIR}/scripts/source_to_md/ppt_to_md.py <file>` |
 | EPUB / HTML / LaTeX / RST / other | `python3 ${SKILL_DIR}/scripts/source_to_md/doc_to_md.py <file>` |
+| Bundler / SPA-style HTML (Gamma export, Framer-style single-file design system, anything containing `<script type="__bundler/manifest">`) | `doc_to_md.py` auto-detects and unpacks; you can also call `python3 ${SKILL_DIR}/scripts/source_to_md/html_bundler_extract.py <file>` directly. Outputs `<file>.real.html` (decoded template + tokens.css) and `<file>_assets/` (named brand PNGs, JSX components, fonts). When this fires, treat the unpacked PNGs and `:root` tokens.css as the canonical brand reference — do NOT redraw logos from imagination. |
 | Web link | `python3 ${SKILL_DIR}/scripts/source_to_md/web_to_md.py <URL>` |
 | WeChat / high-security site | `python3 ${SKILL_DIR}/scripts/source_to_md/web_to_md.py <URL>` (requires `curl_cffi`; falls back to `node web_to_md.cjs <URL>` only if that package is unavailable) |
 | Markdown | Read directly |

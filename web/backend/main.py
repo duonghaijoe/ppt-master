@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,6 +25,8 @@ from files import (
     project_path,
     list_slides,
     list_exports,
+    list_tree,
+    safe_rel,
     init_project,
     import_source,
     import_url,
@@ -32,7 +34,7 @@ from files import (
 )
 
 
-app = FastAPI(title="PPT Master Web", version="0.1.0")
+app = FastAPI(title="Awesome Deck — AI-powered presentations", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,6 +48,8 @@ app.add_middleware(
 class CreateSessionBody(BaseModel):
     name: str
     format: str = "ppt169"
+    permission_mode: str = "auto"  # "auto" | "confirm"
+    model_tier: str = "auto"  # "auto" | "light" | "general" | "premium"
 
 
 class ChatBody(BaseModel):
@@ -58,6 +62,25 @@ class UrlImportBody(BaseModel):
 
 class AttachSessionBody(BaseModel):
     name: str
+    permission_mode: str = "auto"
+    model_tier: str = "auto"
+
+
+class PermissionDecisionBody(BaseModel):
+    request_id: str
+    decision: str  # "approve" | "deny"
+
+
+class PermissionModeBody(BaseModel):
+    mode: str  # "auto" | "confirm"
+
+
+class ModelTierBody(BaseModel):
+    tier: str  # "auto" | "light" | "general" | "premium"
+
+
+class SvgSaveBody(BaseModel):
+    content: str
 
 
 @app.get("/api/health")
@@ -82,6 +105,24 @@ def projects_list():
     return {"projects": items}
 
 
+def _norm_mode(m: str) -> str:
+    return "confirm" if m == "confirm" else "auto"
+
+
+# UI tier → CLI model alias. We deliberately don't surface raw model IDs to
+# users; the tier is the contract.
+_TIER_TO_MODEL: dict[str, Optional[str]] = {
+    "auto": None,
+    "light": "haiku",
+    "general": "sonnet",
+    "premium": "opus",
+}
+
+
+def _norm_tier(t: str) -> str:
+    return t if t in _TIER_TO_MODEL else "auto"
+
+
 @app.post("/api/sessions")
 async def create_session(body: CreateSessionBody):
     try:
@@ -89,10 +130,15 @@ async def create_session(body: CreateSessionBody):
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
     session = await registry.create(proj)
+    session.permission_mode = _norm_mode(body.permission_mode)
+    tier = _norm_tier(body.model_tier)
+    session.model = _TIER_TO_MODEL[tier]
     return {
         "session_id": session.id,
         "project": proj.name,
         "project_path": str(proj.relative_to(REPO_ROOT)),
+        "permission_mode": session.permission_mode,
+        "model_tier": tier,
     }
 
 
@@ -103,7 +149,55 @@ async def attach_session(body: AttachSessionBody):
     if not proj.exists():
         raise HTTPException(status_code=404, detail=f"project not found: {body.name}")
     session = await registry.create(proj)
-    return {"session_id": session.id, "project": proj.name}
+    session.permission_mode = _norm_mode(body.permission_mode)
+    tier = _norm_tier(body.model_tier)
+    session.model = _TIER_TO_MODEL[tier]
+    return {
+        "session_id": session.id,
+        "project": proj.name,
+        "permission_mode": session.permission_mode,
+        "model_tier": tier,
+    }
+
+
+@app.post("/api/sessions/{sid}/permission_mode")
+def set_mode(sid: str, body: PermissionModeBody):
+    session = registry.get(sid)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    session.permission_mode = _norm_mode(body.mode)
+    return {"permission_mode": session.permission_mode}
+
+
+@app.post("/api/sessions/{sid}/model_tier")
+async def set_model_tier(sid: str, body: ModelTierBody):
+    session = registry.get(sid)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    tier = _norm_tier(body.tier)
+    await session.set_model(_TIER_TO_MODEL[tier])
+    return {"model_tier": tier}
+
+
+@app.post("/api/sessions/{sid}/interrupt")
+async def interrupt_session(sid: str):
+    session = registry.get(sid)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    delivered = await session.interrupt()
+    return {"ok": True, "delivered": delivered}
+
+
+@app.post("/api/sessions/{sid}/permission")
+def resolve_permission(sid: str, body: PermissionDecisionBody):
+    session = registry.get(sid)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    decision = "approve" if body.decision == "approve" else "deny"
+    ok = session.resolve_permission(body.request_id, decision)
+    if not ok:
+        raise HTTPException(status_code=404, detail="request not pending")
+    return {"ok": True, "decision": decision}
 
 
 @app.delete("/api/sessions/{sid}")
@@ -132,29 +226,56 @@ async def send_message(sid: str, body: ChatBody):
     })
 
 
-@app.post("/api/sessions/{sid}/import/file")
-async def import_file(sid: str, file: UploadFile = File(...)):
-    session = registry.get(sid)
-    if not session:
-        raise HTTPException(status_code=404, detail="session not found")
-
-    suffix = Path(file.filename or "upload").suffix
+async def _save_upload_to_project(session, file: UploadFile, relpath: Optional[str] = None) -> dict:
+    """Save one UploadFile into the session's project, returning a JSON-friendly dict."""
+    name = relpath or file.filename or "upload"
+    suffix = Path(name).suffix
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp_path = Path(tmp.name)
         chunk = await file.read(1024 * 1024)
         while chunk:
             tmp.write(chunk)
             chunk = await file.read(1024 * 1024)
+    result = import_source(session.project_path, tmp_path, Path(name).name)
+    return {
+        "name": name,
+        "imported": str(result.relative_to(REPO_ROOT)),
+        "is_markdown": result.suffix.lower() == ".md",
+        "is_image": result.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"},
+    }
 
+
+@app.post("/api/sessions/{sid}/import/file")
+async def import_file(sid: str, file: UploadFile = File(...)):
+    session = registry.get(sid)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
     try:
-        result = import_source(session.project_path, tmp_path, file.filename or tmp_path.name)
+        return await _save_upload_to_project(session, file)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    return {
-        "imported": str(result.relative_to(REPO_ROOT)),
-        "is_markdown": result.suffix.lower() == ".md",
-    }
+
+@app.post("/api/sessions/{sid}/import/files")
+async def import_files(
+    sid: str,
+    files: list[UploadFile] = File(...),
+    paths: Optional[list[str]] = Form(None),
+):
+    """Multi-file upload from chat (supports drag-drop of folders + images)."""
+    session = registry.get(sid)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    results: list[dict] = []
+    errors: list[dict] = []
+    for i, f in enumerate(files):
+        rel = paths[i] if paths and i < len(paths) else None
+        try:
+            results.append(await _save_upload_to_project(session, f, rel))
+        except Exception as e:
+            errors.append({"name": rel or f.filename, "error": str(e)})
+    return {"imported": results, "errors": errors}
 
 
 @app.post("/api/sessions/{sid}/import/url")
@@ -179,6 +300,42 @@ def exports(name: str):
     return {"project": name, "exports": list_exports(name)}
 
 
+@app.get("/api/projects/{name}/tree")
+def project_tree(name: str, path: str = ""):
+    if not project_path(name).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return list_tree(name, path)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid path")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not found")
+
+
+@app.get("/api/projects/{name}/file")
+def project_file(name: str, path: str):
+    if not project_path(name).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        target = safe_rel(name, path)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(target, headers={"Cache-Control": "no-store"})
+
+
+_IMAGE_MEDIA = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".svg": "image/svg+xml",
+}
+
+
 @app.get("/api/projects/{name}/svg/{filename}")
 def serve_svg(name: str, filename: str):
     if not filename.endswith(".svg") or "/" in filename or ".." in filename:
@@ -187,6 +344,43 @@ def serve_svg(name: str, filename: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="not found")
     return FileResponse(path, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/projects/{name}/svg/{filename}")
+def save_svg(name: str, filename: str, body: SvgSaveBody):
+    """Overwrite an existing SVG in svg_output/. Refuses if the target file
+    is missing or the path tries to escape the folder."""
+    if not filename.endswith(".svg") or "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    folder = project_path(name) / "svg_output"
+    target = folder / filename
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    # Path containment guard.
+    try:
+        target.resolve().relative_to(folder.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="path escape")
+    text = body.content
+    # Cheap sanity check: must contain an <svg ...> tag near the start.
+    head = text.lstrip()[:200].lower()
+    if "<svg" not in head:
+        raise HTTPException(status_code=400, detail="not an SVG document")
+    target.write_text(text, encoding="utf-8")
+    return {"ok": True, "bytes": len(text.encode("utf-8"))}
+
+
+@app.get("/api/projects/{name}/images/{filename}")
+def serve_project_image(name: str, filename: str):
+    """Serve files from <project>/images/. Required so SVGs in svg_output/
+    can reference ../images/foo.png via relative URL when rendered in browser."""
+    if "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    path = project_path(name) / "images" / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    media = _IMAGE_MEDIA.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(path, media_type=media, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/projects/{name}/export.pptx")

@@ -26,6 +26,16 @@ As a top-tier AI presentation strategist, receive source documents, perform cont
 
 > **Execution discipline**: This is the last BLOCKING checkpoint in the pipeline. After confirmation, complete the Design Spec and proceed to image generation / SVG / post-processing without further pauses.
 
+> **🔒 Bundled / brand DS source detected (HARD rule)** — If `sources/` contains a `*.real.html` + `*_assets/` pair (produced by `scripts/source_to_md/html_bundler_extract.py`, or auto-emitted by `doc_to_md.py` when the input HTML carried a `__bundler/manifest`), the user has supplied a real Design System. In this case:
+>
+> 1. **Read `*.real.html` for the `:root` tokens.css** (`--brand-*`, type scale, spacing, radius) and copy hex values verbatim into Confirmation **e** (Color) and the size scale into Confirmation **g** (Typography). Do NOT invent dark/tint shades — if the DS only provides `--brand-green` and `--brand-green-dark`, those are your only greens. No fabricated `#2A3D1A`-style "deepened" colors.
+> 2. **Open the largest `*.jsx` file in `*_assets/`** for the live React components — the brand object (e.g. `const DS = { green: '#…', red: '#…' }`), color scales (`green50…green900`, `red50…red900`, neutral 11-step), and any cover/page layouts. Treat these as authoritative for spec_lock.
+> 3. **Treat the named PNGs in `*_assets/` as locked artwork** — `logoH*`, `icon*`, `wm*`, `email*`, `fbAvatar`, `footerJpg`. In Confirmation **h** (Image) and §VIII of design_spec, list these by filename and reference them via `<image href="images/<name>.png" …/>` in SVGs. **NEVER redraw a brand logo with `<path>`/`<circle>`/`<rect>`** — copy the PNG into `<project>/images/` and embed it.
+> 4. **Page chrome must match the DS, not invented defaults** — if the DS does not show a per-page header stripe / footer / divider in any of its sample pages (cover/section/content), do not add one. Headers, eyebrows, and stripe colors come from what the DS actually renders.
+> 5. **Slogan / tagline text must match exactly** (case, punctuation, exclamation). Pull from the DS Cover/Hero JSX, not from memory or the placeholder thumbnail.
+>
+> When this rule fires, log a one-line note in `design_spec.md §III` such as `Color/typography/imagery locked from sources/<basename>.real.html + sources/<basename>_assets/ (no invented values)`.
+
 ### a. Canvas Format Confirmation
 
 Recommend format based on scenario (see [`canvas-formats.md`](canvas-formats.md)).

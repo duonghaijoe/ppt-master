@@ -63,6 +63,45 @@ python3 skills/ppt-master/scripts/finalize_svg.py <project_path>
 python3 skills/ppt-master/scripts/svg_to_pptx.py <project_path>
 ```
 
+## Per-Project Skill File
+
+Every project under `projects/` accumulates its own theme, brand palette, header
+pattern, repeatable scripts, and gotchas. Capture that context in a project-local
+`SKILL.md` so future sessions can pick it up cold.
+
+### Rules
+
+1. **Create on completion.** After the first successful PPTX export for a project,
+   write `projects/<group>/<project>/SKILL.md` before declaring the work done.
+   The file is the project's reusable context memory.
+2. **Refresh on goal completion.** Whenever you complete a goal that changes brand,
+   layout, content rules, scripts, or naming conventions for an existing project,
+   update its `SKILL.md` (and append a row to its **Update Log**) before moving on
+   or considering the turn complete. If the user changes direction mid-task, refresh
+   the SKILL.md as part of the same turn so it never lags reality.
+3. **Project-local only.** Project SKILLs always live at the project root, never
+   under `skills/` or `~/.claude/skills/`. The repo-level skills under
+   `skills/ppt-master/` stay generic; project SKILLs hold the specifics.
+4. **Read before editing.** Before regenerating, re-skinning, or editing slides
+   for an existing project, read its `SKILL.md` first — it overrides anything
+   inferred from the source files when there is a conflict.
+
+### Required sections
+
+Every project `SKILL.md` should cover:
+
+- **When to Use** — phrases or intents that should route here
+- **Project Coordinates** — root path, canvas, slide count, source/twin decks, final export path
+- **Brand Palette (Locked)** — every hex with its role and where it appears
+- **Typography (Locked)** — font stacks
+- **Page Chrome / Header Pattern** — y-coordinates of stripe, logo, eyebrow, title, footer
+- **Content Source** — where copy lives (source docs, twin v1, total.md), what to edit when
+- **Repeatable Tasks** — exact shell commands for re-skin, re-export, header refresh, notes split
+- **Hard Rules / Gotchas** — venv vs system Python, drift-allowed colors, do-not-touch decks, header collision zones
+- **Update Log** — table of `date | change`
+
+Reference example: [`projects/katalon/new_ways_of_working_internal_ppt169_20260509/SKILL.md`](projects/katalon/new_ways_of_working_internal_ppt169_20260509/SKILL.md).
+
 ## Architecture
 
 - `skills/ppt-master/SKILL.md` — main workflow authority.
@@ -71,4 +110,5 @@ python3 skills/ppt-master/scripts/svg_to_pptx.py <project_path>
 - `skills/ppt-master/scripts/docs/` — topic-focused script docs.
 - `skills/ppt-master/templates/` — layout templates, chart templates, icon library.
 - `examples/` — example projects.
-- `projects/` — user project workspace.
+- `projects/` — user project workspace. Each project carries its own `SKILL.md`
+  with brand, header pattern, and regen commands (see § Per-Project Skill File).

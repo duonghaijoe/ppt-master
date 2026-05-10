@@ -248,6 +248,52 @@ def _convert_html(input_file: Path, out_file: Path) -> str:
     media_dir, rel_media_dir = _ensure_media_dir(out_file)
     raw_html = input_file.read_text(encoding="utf-8", errors="replace")
 
+    # Bundler-style single-file HTML (Gamma exports etc.) hides all real content
+    # inside <script type="__bundler/...">. Naive stripping erases the design
+    # tokens, brand assets, and JSX. Detect and unpack first; the rendered
+    # template HTML and assets land next to the input, then we keep going so the
+    # caller still gets a markdown stub for the non-script chrome.
+    try:
+        from html_bundler_extract import is_bundler_html, extract as _bundler_extract
+    except ImportError:
+        # Same directory import; fall back to file path import
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "html_bundler_extract",
+            Path(__file__).parent / "html_bundler_extract.py",
+        )
+        if spec and spec.loader:
+            _mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+            is_bundler_html = _mod.is_bundler_html  # type: ignore[assignment]
+            _bundler_extract = _mod.extract  # type: ignore[assignment]
+        else:
+            is_bundler_html = lambda _raw: False  # type: ignore[assignment]
+            _bundler_extract = None  # type: ignore[assignment]
+
+    bundler_summary: dict | None = None
+    if is_bundler_html(raw_html) and _bundler_extract is not None:
+        try:
+            bundler_summary = _bundler_extract(input_file)
+            real_html_path = bundler_summary.get("real_html")
+            if real_html_path:
+                # Re-read the decoded template so markdown reflects the actual page
+                raw_html = Path(real_html_path).read_text(encoding="utf-8", errors="replace")
+                print(
+                    f"[INFO] Bundler HTML detected — using decoded template "
+                    f"({bundler_summary['asset_count']} assets unpacked to "
+                    f"{bundler_summary['assets_dir']})"
+                )
+            else:
+                print(
+                    f"[INFO] Bundler HTML detected — assets unpacked, but no template script "
+                    f"found ({bundler_summary['asset_count']} assets to "
+                    f"{bundler_summary['assets_dir']})"
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort, fall through to plain HTML
+            print(f"[WARN] Bundler extraction failed ({exc}); falling back to raw HTML parse")
+            bundler_summary = None
+
     # Strip non-content elements (head/style/script) so metadata doesn't leak into MD
     soup = BeautifulSoup(raw_html, "html.parser")
     for tag in soup(["head", "style", "script", "noscript"]):
@@ -257,7 +303,40 @@ def _convert_html(input_file: Path, out_file: Path) -> str:
 
     markdown = markdownify(html, heading_style="ATX", bullets="-")
     # Collapse 3+ blank lines to 2 for tidier output
-    markdown = re.sub(r"\n{3,}", "\n\n", markdown).strip() + "\n"
+    markdown = re.sub(r"\n{3,}", "\n\n", markdown).strip()
+
+    # Bundler exports render their content from JSX at runtime, so the decoded
+    # template usually has no markdown-able body. Prepend a pointer block so
+    # downstream consumers know where the real DS tokens / brand assets live.
+    if bundler_summary is not None:
+        pointer_lines = [
+            f"# {input_file.stem} (bundler export)",
+            "",
+            "This HTML is a Gamma/SPA-style bundle whose content is rendered from JSX",
+            "at runtime. The visible markdown body is intentionally minimal — the real",
+            "design system lives in the unpacked artifacts below.",
+            "",
+            "## Unpacked artifacts",
+            "",
+            f"- Decoded template HTML: `{Path(bundler_summary['real_html']).name if bundler_summary.get('real_html') else '(none)'}`",
+            f"- Asset directory: `{Path(bundler_summary['assets_dir']).name}/` "
+            f"({bundler_summary['asset_count']} files, "
+            f"{bundler_summary['named_count']} with human-readable ids)",
+            f"- Asset index: `{Path(bundler_summary['assets_dir']).name}/INDEX.md`",
+            "",
+            "## How to read the design system",
+            "",
+            "1. Open the decoded template HTML for the `:root` tokens.css "
+            "(--brand-*, type scale, spacing, radius).",
+            "2. Open any `.jsx` file in the asset directory for the live React "
+            "components and color/scale objects.",
+            "3. Use the named PNGs (`logoH*`, `icon*`, `wm*`, etc.) verbatim — "
+            "they are the brand artwork, do not redraw.",
+            "",
+        ]
+        markdown = "\n".join(pointer_lines) + ("\n" + markdown if markdown else "")
+
+    markdown = markdown.strip() + "\n"
     out_file.write_text(markdown, encoding="utf-8")
 
     if not any(media_dir.iterdir()):
