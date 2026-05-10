@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useSession } from "../SessionContext";
+import type { AgentEvent } from "../hooks/useAgentStream";
 
 type Upload = {
   key: string;
@@ -429,90 +430,99 @@ export function ChatPanel({
             Try: <em>"Generate a 5-slide deck on Q1 sales"</em>
           </div>
         )}
-        {events.map((evt, i) => {
-          if (evt.type === "text") {
-            const isUser = evt.text.startsWith(USER_PREFIX);
-            if (isUser) {
+        {(() => {
+          const blocks = groupEvents(events);
+          return blocks.map((b, i) => {
+            if (b.kind === "user") {
               return (
                 <div
                   key={i}
                   className="bg-brand-cream/60 rounded px-3 py-1.5 whitespace-pre-wrap"
                 >
-                  {evt.text.slice(USER_PREFIX.length)}
+                  {b.text}
                 </div>
               );
             }
-            return (
-              <article key={i} className="prose-md max-w-none">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{evt.text}</ReactMarkdown>
-              </article>
-            );
-          }
-          if (evt.type === "tool_use")
-            return (
-              <div key={i} className="text-xs font-mono text-brand-green">
-                ⚡ {evt.name}
-              </div>
-            );
-          if (evt.type === "tool_result") return null;
-          if (evt.type === "permission_request") {
-            const inputPreview = (() => {
-              try {
-                return typeof evt.input === "string"
-                  ? evt.input
-                  : JSON.stringify(evt.input, null, 2);
-              } catch {
-                return String(evt.input);
-              }
-            })();
-            return (
-              <div
-                key={i}
-                className="border border-amber-300 bg-amber-50 rounded p-2 space-y-1.5"
-              >
-                <div className="text-xs font-medium text-amber-800">
-                  Permission requested · <span className="font-mono">{evt.tool}</span>
+            if (b.kind === "assistant") {
+              return (
+                <article key={i} className="prose-md max-w-none">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{b.text}</ReactMarkdown>
+                </article>
+              );
+            }
+            if (b.kind === "tools") {
+              const isLast = i === blocks.length - 1;
+              const anyUnresolved = b.calls.some((c) => c.result === undefined);
+              return (
+                <ToolCluster
+                  key={i}
+                  calls={b.calls}
+                  busy={streaming && isLast && anyUnresolved}
+                />
+              );
+            }
+            if (b.kind === "permission") {
+              const evt = b.evt;
+              const preview = (() => {
+                try {
+                  return typeof evt.input === "string"
+                    ? evt.input
+                    : JSON.stringify(evt.input, null, 2);
+                } catch {
+                  return String(evt.input);
+                }
+              })();
+              return (
+                <div
+                  key={i}
+                  className="border border-amber-300 bg-amber-50 rounded p-2 space-y-1.5"
+                >
+                  <div className="text-xs font-medium text-amber-800">
+                    Permission requested · <span className="font-mono">{evt.tool}</span>
+                  </div>
+                  <pre className="text-[11px] bg-white border border-amber-200 rounded p-2 max-h-40 overflow-auto whitespace-pre-wrap font-mono text-gray-700">
+                    {preview.length > 1200 ? preview.slice(0, 1200) + "\n…(truncated)" : preview}
+                  </pre>
+                  {evt.resolved ? (
+                    <div className="text-[11px] text-gray-500">
+                      {evt.resolved === "approve" ? "✓ approved" : "✗ denied"}
+                    </div>
+                  ) : (
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => respondPermission(evt.id, "approve")}
+                        className="px-3 py-1 text-xs bg-brand-green text-white rounded hover:opacity-90"
+                      >
+                        Approve
+                      </button>
+                      <button
+                        onClick={() => respondPermission(evt.id, "deny")}
+                        className="px-3 py-1 text-xs bg-white border border-gray-300 text-gray-700 rounded hover:bg-gray-50"
+                      >
+                        Deny
+                      </button>
+                    </div>
+                  )}
                 </div>
-                <pre className="text-[11px] bg-white border border-amber-200 rounded p-2 max-h-40 overflow-auto whitespace-pre-wrap font-mono text-gray-700">
-                  {inputPreview.length > 1200 ? inputPreview.slice(0, 1200) + "\n…(truncated)" : inputPreview}
-                </pre>
-                {evt.resolved ? (
-                  <div className="text-[11px] text-gray-500">
-                    {evt.resolved === "approve" ? "✓ approved" : "✗ denied"}
-                  </div>
-                ) : (
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => respondPermission(evt.id, "approve")}
-                      className="px-3 py-1 text-xs bg-brand-green text-white rounded hover:opacity-90"
-                    >
-                      Approve
-                    </button>
-                    <button
-                      onClick={() => respondPermission(evt.id, "deny")}
-                      className="px-3 py-1 text-xs bg-white border border-gray-300 text-gray-700 rounded hover:bg-gray-50"
-                    >
-                      Deny
-                    </button>
-                  </div>
-                )}
-              </div>
-            );
-          }
-          if (evt.type === "error")
-            return (
-              <div key={i} className="text-xs text-red-600">
-                ⚠ {evt.message}
-              </div>
-            );
-          if (evt.type === "done")
-            return (
-              <div key={i} className="text-xs text-gray-300 border-t pt-2">
-                — turn complete —
-              </div>
-            );
-          return null;
-        })}
+              );
+            }
+            if (b.kind === "error") {
+              return (
+                <div key={i} className="text-xs text-red-600">
+                  ⚠ {b.message}
+                </div>
+              );
+            }
+            if (b.kind === "done") {
+              return (
+                <div key={i} className="text-xs text-gray-300 border-t pt-2">
+                  — turn complete —
+                </div>
+              );
+            }
+            return null;
+          });
+        })()}
 
         {uploads.slice(-4).map((u) => (
           <div key={u.key} className="text-[11px] text-gray-500 font-mono">
@@ -930,5 +940,195 @@ function SparkIcon() {
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M12 3v3M12 18v3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M3 12h3M18 12h3M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1" />
     </svg>
+  );
+}
+
+// ── Tool clustering ──────────────────────────────────────────────────────
+// The agent fires many small tool calls per turn (Read, Bash, Edit…). The
+// raw stream is noisy, so we collapse consecutive tool_use events into a
+// single accordion row that summarizes them ("Reading ×3 · Running ×2"),
+// pulses while the latest call is still in flight, and folds out per-call
+// detail on click. Permission/error/done events break a cluster.
+
+type ToolCall = {
+  id: string;
+  name: string;
+  input: unknown;
+  result?: string;
+};
+
+type RenderBlock =
+  | { kind: "user"; text: string }
+  | { kind: "assistant"; text: string }
+  | { kind: "tools"; calls: ToolCall[] }
+  | {
+      kind: "permission";
+      evt: Extract<AgentEvent, { type: "permission_request" }>;
+    }
+  | { kind: "error"; message: string }
+  | { kind: "done" };
+
+function groupEvents(events: AgentEvent[]): RenderBlock[] {
+  const blocks: RenderBlock[] = [];
+  let cluster: ToolCall[] | null = null;
+
+  const flush = () => {
+    if (cluster && cluster.length > 0) {
+      blocks.push({ kind: "tools", calls: cluster });
+    }
+    cluster = null;
+  };
+
+  const foldResult = (toolUseId: string, content: string) => {
+    if (cluster) {
+      const c = cluster.find((c) => c.id === toolUseId);
+      if (c) {
+        c.result = content;
+        return;
+      }
+    }
+    for (let b = blocks.length - 1; b >= 0; b--) {
+      const blk = blocks[b];
+      if (blk.kind === "tools") {
+        const c = blk.calls.find((c) => c.id === toolUseId);
+        if (c) {
+          c.result = content;
+          return;
+        }
+      }
+    }
+  };
+
+  for (const evt of events) {
+    if (evt.type === "tool_use") {
+      if (!cluster) cluster = [];
+      cluster.push({ id: evt.id, name: evt.name, input: evt.input });
+      continue;
+    }
+    if (evt.type === "tool_result") {
+      foldResult(evt.tool_use_id, evt.content);
+      continue;
+    }
+    flush();
+    if (evt.type === "text") {
+      const isUser = evt.text.startsWith(USER_PREFIX);
+      blocks.push({
+        kind: isUser ? "user" : "assistant",
+        text: isUser ? evt.text.slice(USER_PREFIX.length) : evt.text,
+      });
+    } else if (evt.type === "permission_request") {
+      blocks.push({ kind: "permission", evt });
+    } else if (evt.type === "error") {
+      blocks.push({ kind: "error", message: evt.message });
+    } else if (evt.type === "done") {
+      blocks.push({ kind: "done" });
+    }
+    // raw events are ignored
+  }
+  flush();
+  return blocks;
+}
+
+const TOOL_LABELS: Record<string, string> = {
+  Read: "Reading",
+  NotebookRead: "Reading",
+  Write: "Writing",
+  Edit: "Editing",
+  MultiEdit: "Editing",
+  NotebookEdit: "Editing",
+  Bash: "Running",
+  Glob: "Searching",
+  Grep: "Searching",
+  WebFetch: "Fetching",
+  WebSearch: "Searching",
+  TodoWrite: "Planning",
+  Task: "Delegating",
+};
+
+function friendlyLabel(name: string): string {
+  return TOOL_LABELS[name] ?? name;
+}
+
+function inputSummary(input: unknown): string {
+  if (!input || typeof input !== "object") {
+    return typeof input === "string" ? (input as string) : "";
+  }
+  const obj = input as Record<string, unknown>;
+  const candidate =
+    obj.file_path ?? obj.command ?? obj.pattern ?? obj.url ?? obj.path ?? obj.query;
+  if (typeof candidate === "string") return candidate;
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    return "";
+  }
+}
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+function ToolCluster({ calls, busy }: { calls: ToolCall[]; busy: boolean }) {
+  const [open, setOpen] = useState(false);
+  const counts = new Map<string, number>();
+  for (const c of calls) {
+    const label = friendlyLabel(c.name);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const summary = Array.from(counts.entries())
+    .map(([k, v]) => (v > 1 ? `${k} ×${v}` : k))
+    .join(" · ");
+
+  return (
+    <div className="rounded-md border border-gray-200 bg-gray-50/70 text-xs">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-2 px-2.5 py-1.5 hover:bg-gray-100 rounded-md text-left"
+      >
+        <span
+          className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+            busy ? "bg-brand-green animate-pulse" : "bg-gray-300"
+          }`}
+        />
+        <span className="text-gray-700 font-medium truncate">{summary}</span>
+        <span className="text-gray-400 shrink-0">·</span>
+        <span className="text-gray-400 shrink-0">
+          {calls.length} {calls.length === 1 ? "call" : "calls"}
+        </span>
+        <span
+          className="ml-auto text-gray-400 shrink-0 transition-transform"
+          style={{ transform: open ? "rotate(90deg)" : undefined }}
+        >
+          ▸
+        </span>
+      </button>
+      {open && (
+        <div className="border-t border-gray-200 px-2.5 py-1.5 space-y-1 font-mono">
+          {calls.map((c, i) => {
+            const summaryText = inputSummary(c.input);
+            return (
+              <div
+                key={c.id || i}
+                className="flex items-start gap-2 text-[11px]"
+                title={summaryText}
+              >
+                <span className="text-gray-500 w-16 shrink-0">{c.name}</span>
+                <span className="text-gray-700 truncate flex-1">
+                  {truncate(summaryText, 120)}
+                </span>
+                {c.result === undefined ? (
+                  busy ? (
+                    <span className="text-amber-500 shrink-0 animate-pulse">·</span>
+                  ) : null
+                ) : (
+                  <span className="text-brand-green shrink-0">✓</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
