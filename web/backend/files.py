@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -84,17 +85,274 @@ def list_tree(name: str, rel: str = "") -> dict:
 
 
 def list_slides(name: str) -> list[dict]:
-    p = project_path(name) / "svg_output"
-    if not p.exists():
+    return list_dir_slides(name, "svg_output")
+
+
+def list_dir_slides(name: str, rel_dir: str) -> list[dict]:
+    """List `*.svg` files in a project subdirectory, sorted by name.
+
+    Returns the same shape as list_slides for backwards compat — adds a `path`
+    field so callers in arbitrary working dirs (flashcards/, svg_final/, …)
+    can build URLs without re-joining the dir.
+    """
+    if not rel_dir:
         return []
-    out = []
-    for svg in sorted(p.glob("*.svg")):
+    try:
+        target = safe_rel(name, rel_dir)
+    except ValueError:
+        return []
+    if not target.exists() or not target.is_dir():
+        return []
+    rel_dir = rel_dir.strip("/")
+    out: list[dict] = []
+    for svg in sorted(target.glob("*.svg")):
         out.append({
             "name": svg.stem,
             "file": svg.name,
+            "path": f"{rel_dir}/{svg.name}" if rel_dir else svg.name,
             "mtime": int(svg.stat().st_mtime),
         })
     return out
+
+
+# Friendly default labels for well-known project subdirs. The agent can override
+# these by writing custom labels into output_dirs.json; the UI just shows
+# whatever's there.
+_DEFAULT_DIR_LABELS = {
+    "svg_output": "Working slides",
+    "svg_final": "Finalized deck",
+    "templates": "Template SVGs",
+}
+
+
+def _prettify_segment(seg: str) -> str:
+    return seg.replace("_", " ").replace("-", " ").strip().capitalize() or seg
+
+
+def _default_label(rel_dir: str) -> str:
+    """Friendly fallback label when the directive doesn't supply one.
+
+    Nested paths get parent context so a flat picker list stays unambiguous
+    (e.g., `flashcards/templates` → "Flashcards › Templates"). Well-known
+    project dirs (svg_output, svg_final) keep their canonical labels.
+    """
+    rel = rel_dir.strip("/")
+    if not rel:
+        return "/"
+    if rel in _DEFAULT_DIR_LABELS:
+        return _DEFAULT_DIR_LABELS[rel]
+    parts = [p for p in rel.split("/") if p]
+    if not parts:
+        return rel
+    # One-level path → just the leaf, prettified.
+    if len(parts) == 1:
+        return _prettify_segment(parts[0])
+    # Nested → join with the breadcrumb separator so the deck picker can show
+    # context without leaking the underlying path style.
+    return " › ".join(_prettify_segment(p) for p in parts)
+
+
+def _bootstrap_output_dirs(base: Path) -> dict:
+    """Minimal default directive when ``output_dirs.json`` is missing.
+
+    Maintaining the directive is the **agent**'s job — when it creates a new
+    output folder it must register it via the API. This bootstrap only covers
+    the bare standard layout (svg_output / svg_final) so the UI has something
+    to show on a fresh project before the agent has acted.
+    """
+    candidates: list[tuple[str, int]] = []  # (rel_dir, latest_mtime)
+    for rel in ("svg_output", "svg_final"):
+        d = base / rel
+        if d.is_dir() and any(d.glob("*.svg")):
+            mt = max((p.stat().st_mtime for p in d.glob("*.svg")), default=0)
+            candidates.append((rel, int(mt)))
+    candidates.sort(key=lambda x: (x[1], x[0] == "svg_output"), reverse=True)
+    current = candidates[0][0] if candidates else "svg_output"
+    dirs = [
+        {"dir": rel, "label": _default_label(rel)}
+        for rel, _ in candidates
+    ] or [{"dir": "svg_output", "label": _default_label("svg_output")}]
+    return {"current": current, "dirs": dirs}
+
+
+def read_output_dirs(name: str) -> dict:
+    """Return the project's output_dirs directive, bootstrapping if missing.
+
+    Schema: ``{"current": "<rel>", "dirs": [{"dir": "<rel>", "label": "..."}]}``.
+    The file is **agent-owned**: the agent registers each output folder it
+    creates (svg_output, svg_final, flashcards/templates, …). This reader
+    does not auto-discover dirs — if it's not declared, the UI won't show it.
+    """
+    base = project_path(name)
+    if not base.exists():
+        raise FileNotFoundError(name)
+    f = base / "output_dirs.json"
+    if not f.exists():
+        return _bootstrap_output_dirs(base)
+    try:
+        raw = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        # Corrupt directive — fall back to disk scan rather than 500ing the UI.
+        return _bootstrap_output_dirs(base)
+    dirs_in = raw.get("dirs") or []
+    dirs: list[dict] = []
+    seen: set[str] = set()
+    for entry in dirs_in:
+        if isinstance(entry, str):
+            rel = entry.strip("/")
+            label = _default_label(rel)
+        elif isinstance(entry, dict):
+            rel = str(entry.get("dir") or "").strip("/")
+            label = str(entry.get("label") or "").strip() or _default_label(rel)
+        else:
+            continue
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        dirs.append({"dir": rel, "label": label})
+    if not dirs:
+        return _bootstrap_output_dirs(base)
+    current = str(raw.get("current") or "").strip("/")
+    if current not in {d["dir"] for d in dirs}:
+        current = dirs[0]["dir"]
+    return {"current": current, "dirs": dirs}
+
+
+def _sanitize_dirs(name: str, base: Path, dirs_in) -> list[dict]:
+    """Coerce a raw dirs payload into validated [{dir,label}] entries.
+
+    Drops empties, duplicates, non-string types, and paths that escape the
+    project root. Never raises — callers decide what to do with an empty
+    result. Used by both write_output_dirs and register_output_dir so the
+    same containment + dedup logic applies to every write path.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    base_resolved = base.resolve()
+    for entry in dirs_in or []:
+        if isinstance(entry, dict):
+            rel = str(entry.get("dir") or "").strip("/")
+            label = str(entry.get("label") or "").strip() or _default_label(rel)
+        elif isinstance(entry, str):
+            rel = entry.strip("/")
+            label = _default_label(rel)
+        else:
+            continue
+        if not rel or rel in seen:
+            continue
+        # Path containment guard — directive must point inside the project.
+        try:
+            target = safe_rel(name, rel)
+        except ValueError:
+            continue
+        try:
+            target.resolve().relative_to(base_resolved)
+        except ValueError:
+            continue
+        seen.add(rel)
+        out.append({"dir": rel, "label": label})
+    return out
+
+
+def _atomic_write_directive(base: Path, payload: dict) -> None:
+    """Write output_dirs.json atomically with a one-slot backup.
+
+    Failure modes we're guarding against:
+    - Agent-side crash mid-write leaving a truncated JSON file (UI would
+      silently fall back to bootstrap and forget all registered dirs).
+    - Concurrent writes from two callers racing the same file.
+
+    Strategy: serialize → write to .tmp → fsync → rename over the target.
+    Keep the previous good version as `.bak` so a corrupt parse upstream can
+    recover. ``os.replace`` is atomic on POSIX.
+    """
+    import os
+    target = base / "output_dirs.json"
+    tmp = base / "output_dirs.json.tmp"
+    bak = base / "output_dirs.json.bak"
+    body = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    # Validate roundtrip before touching disk — we serialized it ourselves
+    # so this should always pass, but a self-check costs nothing and shields
+    # against schema drift sneaking in.
+    json.loads(body)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(body)
+        f.flush()
+        os.fsync(f.fileno())
+    if target.exists():
+        try:
+            shutil.copy2(target, bak)
+        except Exception:
+            pass  # best-effort backup; don't block the write
+    os.replace(tmp, target)
+
+
+def write_output_dirs(name: str, data: dict) -> dict:
+    """Persist a sanitized output_dirs directive and return what got written.
+
+    Replaces the whole directive. Prefer ``register_output_dir`` when you just
+    want to append a single entry — it avoids the "agent forgot existing
+    entries" failure mode entirely.
+    """
+    base = project_path(name)
+    if not base.exists():
+        raise FileNotFoundError(name)
+    dirs = _sanitize_dirs(name, base, data.get("dirs"))
+    if not dirs:
+        raise ValueError("output_dirs requires at least one dir")
+    current = str(data.get("current") or "").strip("/")
+    if current not in {d["dir"] for d in dirs}:
+        current = dirs[0]["dir"]
+    out = {"current": current, "dirs": dirs}
+    _atomic_write_directive(base, out)
+    return out
+
+
+def register_output_dir(
+    name: str,
+    rel_dir: str,
+    label: str | None = None,
+    set_current: bool = False,
+) -> dict:
+    """Append (or update) a single directive entry without resending the list.
+
+    This is the safe append path for the agent: it reads the current directive,
+    inserts/updates the one entry, and atomically writes the result. Existing
+    entries are preserved, so the agent can never accidentally drop decks by
+    forgetting to include them in a full PUT.
+
+    If the dir is already registered, its label is updated when a non-empty
+    ``label`` is supplied; otherwise the existing label is kept. When
+    ``set_current`` is True, the new dir becomes the active one.
+    """
+    base = project_path(name)
+    if not base.exists():
+        raise FileNotFoundError(name)
+    rel = (rel_dir or "").strip("/")
+    if not rel:
+        raise ValueError("dir is required")
+    # Reuse the same sanitizer for the single entry — catches path escapes,
+    # empty leaf segments, etc., consistent with full-PUT behavior.
+    entry = {"dir": rel, "label": (label or "").strip() or _default_label(rel)}
+    cleaned = _sanitize_dirs(name, base, [entry])
+    if not cleaned:
+        raise ValueError(f"invalid output dir: {rel_dir!r}")
+    new_entry = cleaned[0]
+
+    current = read_output_dirs(name)
+    dirs = list(current["dirs"])
+    found = False
+    for i, d in enumerate(dirs):
+        if d["dir"] == new_entry["dir"]:
+            # Preserve label unless the caller supplied a new one.
+            if label and label.strip():
+                dirs[i] = {"dir": d["dir"], "label": new_entry["label"]}
+            found = True
+            break
+    if not found:
+        dirs.append(new_entry)
+    active = new_entry["dir"] if set_current else current["current"]
+    return write_output_dirs(name, {"current": active, "dirs": dirs})
 
 
 def list_recent(name: str, limit: int = 20) -> list[dict]:

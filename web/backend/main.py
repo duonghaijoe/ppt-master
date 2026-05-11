@@ -24,10 +24,14 @@ from files import (
     REPO_ROOT,
     project_path,
     list_slides,
+    list_dir_slides,
     list_exports,
     list_recent,
     list_tree,
     deck_summary,
+    read_output_dirs,
+    register_output_dir,
+    write_output_dirs,
     safe_rel,
     init_project,
     import_source,
@@ -35,6 +39,14 @@ from files import (
     watch_project,
 )
 from svg_inline import fold_icons, inline_icons
+from templates import (
+    create_project_from_template,
+    delete_template,
+    list_templates,
+    read_template,
+    save_project_as_template,
+    template_file_path,
+)
 
 
 app = FastAPI(title="Awesome Deck — AI-powered presentations", version="0.1.0")
@@ -84,6 +96,37 @@ class ModelTierBody(BaseModel):
 
 class SvgSaveBody(BaseModel):
     content: str
+
+
+class OutputDirsBody(BaseModel):
+    current: str
+    dirs: list[dict]
+
+
+class OutputDirsCurrentBody(BaseModel):
+    current: str
+
+
+class OutputDirsRegisterBody(BaseModel):
+    dir: str
+    label: str | None = None
+    set_current: bool = False
+
+
+class SaveTemplateBody(BaseModel):
+    source_project: str
+    name: str
+    description: str | None = None
+    # Project-relative paths (under images/) of brand assets to include.
+    # The agent curates this list from SKILL.md so we don't accidentally
+    # ship per-deck illustrations. Empty list = no images.
+    include_images: list[str] = []
+
+
+class CreateFromTemplateBody(BaseModel):
+    template: str
+    project_name: str
+    format: str | None = None
 
 
 @app.get("/api/health")
@@ -294,7 +337,15 @@ async def import_url_route(sid: str, body: UrlImportBody):
 
 
 @app.get("/api/projects/{name}/slides")
-def slides(name: str):
+def slides(name: str, dir: str | None = None):
+    """List SVG slides. Defaults to `svg_output/` for back-compat.
+
+    When `dir` is supplied, lists `*.svg` under that project-relative folder
+    instead — used by Workbench to render decks in registered working dirs
+    other than `svg_output/` (svg_final, flashcards/templates, …).
+    """
+    if dir:
+        return {"project": name, "slides": list_dir_slides(name, dir)}
     return {"project": name, "slides": list_slides(name)}
 
 
@@ -418,6 +469,73 @@ def serve_svg(name: str, filename: str):
     )
 
 
+@app.get("/api/projects/{name}/output-dirs")
+def output_dirs(name: str):
+    """Return the project's output_dirs directive, enriched with slide listings.
+
+    The directive is the single source of truth for Workbench: it lists every
+    deck the agent has produced (svg_output/, svg_final/, flashcards/…), each
+    with a friendly label the UI displays in place of the raw path.
+    """
+    if not project_path(name).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        directive = read_output_dirs(name)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="project not found")
+    enriched = []
+    for entry in directive["dirs"]:
+        slides = list_dir_slides(name, entry["dir"])
+        enriched.append({
+            **entry,
+            "slides": slides,
+            "count": len(slides),
+            "mtime": max((s["mtime"] for s in slides), default=0),
+        })
+    return {"current": directive["current"], "dirs": enriched}
+
+
+@app.put("/api/projects/{name}/output-dirs")
+def put_output_dirs(name: str, body: OutputDirsBody):
+    """Replace the directive (used by the agent to register a new working dir)."""
+    if not project_path(name).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return write_output_dirs(name, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/projects/{name}/output-dirs/current")
+def set_output_dirs_current(name: str, body: OutputDirsCurrentBody):
+    """Flip the active working dir (used when the user picks one in Workbench)."""
+    if not project_path(name).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    directive = read_output_dirs(name)
+    target = body.current.strip("/")
+    if target not in {d["dir"] for d in directive["dirs"]}:
+        raise HTTPException(status_code=400, detail="dir not registered")
+    directive["current"] = target
+    return write_output_dirs(name, directive)
+
+
+@app.post("/api/projects/{name}/output-dirs/register")
+def register_dir(name: str, body: OutputDirsRegisterBody):
+    """Append (or update) a single deck entry without resending the full list.
+
+    This is the safe path for the agent: it preserves every existing dir, so
+    a forgetful caller can never accidentally unregister other decks.
+    """
+    if not project_path(name).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return register_output_dir(name, body.dir, body.label, body.set_current)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="project not found")
+
+
 @app.post("/api/projects/{name}/svg/{filename}")
 def save_svg(name: str, filename: str, body: SvgSaveBody):
     """Overwrite an existing SVG in svg_output/. Refuses if the target file
@@ -441,6 +559,36 @@ def save_svg(name: str, filename: str, body: SvgSaveBody):
     # Restore <use data-icon="…"/> placeholders. The GET endpoint expands
     # them so the browser can render real geometry; without this fold, an
     # editor save would persist the expansion and lose the abstraction.
+    try:
+        text = fold_icons(text)
+    except Exception:
+        pass
+    target.write_text(text, encoding="utf-8")
+    return {"ok": True, "bytes": len(text.encode("utf-8"))}
+
+
+@app.post("/api/projects/{name}/svg-save")
+def save_svg_path(name: str, path: str, body: SvgSaveBody):
+    """Path-based save: overwrites any existing `.svg` inside the project.
+
+    The legacy `/svg/{filename}` endpoint is hardcoded to svg_output/. This
+    one accepts any registered working dir (svg_final, flashcards/templates, …)
+    so the SlideEditor stays useful when the user switches decks.
+    """
+    if not project_path(name).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        target = safe_rel(name, path)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid path")
+    if target.suffix.lower() != ".svg":
+        raise HTTPException(status_code=400, detail="not an svg path")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    text = body.content
+    head = text.lstrip()[:200].lower()
+    if "<svg" not in head:
+        raise HTTPException(status_code=400, detail="not an SVG document")
     try:
         text = fold_icons(text)
     except Exception:
@@ -473,6 +621,96 @@ def serve_latest_pptx(name: str):
         media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
         filename=items[0]["file"],
     )
+
+
+# ─── Templates ─────────────────────────────────────────────────────────────
+# Reusable design DNA snapshots. See web/backend/templates.py for the
+# packaging contract. Agent-facing flow: user says "save this as a template"
+# → agent picks brand image files from SKILL.md context → POST /api/templates.
+
+@app.get("/api/templates")
+def templates_list():
+    return {"templates": list_templates()}
+
+
+@app.get("/api/templates/{name}")
+def templates_detail(name: str):
+    try:
+        return read_template(name)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="template not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/templates/{name}/file")
+def templates_file(name: str, path: str = ""):
+    """Serve a file from a template directory (thumbnail, SKILL.md, etc.)."""
+    try:
+        target = template_file_path(name, path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="template not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    media = "application/octet-stream"
+    suffix = target.suffix.lower()
+    if suffix == ".svg":
+        media = "image/svg+xml"
+    elif suffix in {".md", ".txt"}:
+        media = "text/plain; charset=utf-8"
+    elif suffix == ".json":
+        media = "application/json"
+    elif suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        media = f"image/{ 'jpeg' if suffix == '.jpg' else suffix[1:] }"
+    return FileResponse(target, media_type=media, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/templates")
+def templates_create(body: SaveTemplateBody):
+    try:
+        return save_project_as_template(
+            body.source_project,
+            body.name,
+            body.description or "",
+            body.include_images,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="source project not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/templates/{name}")
+def templates_delete(name: str):
+    try:
+        delete_template(name)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="template not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"deleted": name}
+
+
+@app.post("/api/projects/from-template")
+def projects_from_template(body: CreateFromTemplateBody):
+    try:
+        project_dir = create_project_from_template(
+            body.template,
+            body.project_name,
+            body.format,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="template not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "project": project_dir.name,
+        "path": str(project_dir.relative_to(REPO_ROOT)),
+    }
 
 
 @app.get("/api/projects/{name}/events")

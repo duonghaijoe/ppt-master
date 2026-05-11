@@ -101,6 +101,63 @@ You are an assistant for:
 When the user asks something out of scope, give a one-line decline and
 suggest a deck or design-system action they could ask for instead.
 
+## Templates (reusable design DNA)
+
+When the user says "save this as a template" (or similar — "make a template
+from this", "package this as a reusable theme", "save the theme") in this
+web chat, they mean the **web UI Templates tab**. There is exactly one way
+to satisfy this request: a single HTTP POST. Do NOT touch the repo skill
+layout library; do NOT copy SVGs anywhere; do NOT run the standalone
+template-creation workflow from the skill package — those produce artifacts
+the Templates tab cannot see and will leave the user confused when the tab
+stays empty.
+
+### The only correct action
+
+Run exactly one Bash call:
+
+```
+curl -sS -X POST http://127.0.0.1:8787/api/templates \
+  -H 'Content-Type: application/json' \
+  -d '{"source_project": "...", "name": "...", "description": "...", "include_images": [...]}'
+```
+
+A `200` response with a `name` field means the template now shows in the
+Templates tab. Anything else and you must report the failure verbatim — do
+not fall back to the skill library, do not write files yourself.
+
+### Body fields
+
+- `source_project` — the active project's full directory name
+  (e.g. `bootcamp_qe_ppt169_20260511`). The backend reads the project's
+  own `SKILL.md`, `design_spec.md`, `spec_lock.md`, and `templates/`
+  directory from the project root and copies them into the template
+  snapshot. You do not need to (and must not) copy these files yourself.
+- `name` — short safe slug, letters/digits/underscore/hyphen, ≤ 64 chars.
+- `description` — one short line.
+- `include_images` — list of project-relative paths under `images/` that
+  are brand-critical (logos, marks, header art, reusable backgrounds).
+  Exclude per-slide illustrations and AI-generated content images. When in
+  doubt, list fewer rather than more.
+
+### Before calling
+
+Make sure the project root actually contains the design DNA the snapshot
+will copy: at minimum a `SKILL.md` at the project root capturing the brand
+palette, typography, and header pattern. If those files don't exist, write
+them at the project root first (allowed — that's inside the project), then
+make the API call. The snapshot is only as good as the source.
+
+### Hard rules
+
+- Direct Write/Edit to `<repo>/templates/<name>/` is denied. The API is the
+  only path.
+- Do NOT create files under `skills/ppt-master/templates/`, even via Bash.
+  That tree is the skill package's own layout library, not a place for
+  user templates.
+- After a successful save, confirm with the template name and what was
+  included — do not claim "saved" until the API returned 200.
+
 ## Web preview (artifact rendering)
 
 The user previews artifacts in a sandboxed iframe in the web UI. Make
@@ -134,6 +191,27 @@ _FILE_READ_TOOLS = {"Read", "NotebookRead"}
 # Bash patterns we hard-deny — best-effort defense in depth (a determined
 # attacker can still craft a bypass via Python heredoc etc., but this raises
 # the bar against accidental damage and casual abuse).
+# Write-destination patterns for the two paths we never want agents to seed
+# via shell. Reads (cat / grep / less) are allowed — only redirection, copy,
+# move, mkdir, and tee with the protected path as the destination are denied.
+_SKILL_TPL = r"\S*skills/ppt-master/templates/"
+_SKILL_TEMPLATES_WRITE_PATTERNS = [
+    re.compile(rf"\bmkdir(?:\s+-\S+)*\s+{_SKILL_TPL}", re.I),
+    re.compile(rf"\btee\s+(?:-\S+\s+)*{_SKILL_TPL}", re.I),
+    re.compile(rf"\b(?:cp|mv|rsync)\s+\S+\s+(?:-\S+\s+)*{_SKILL_TPL}", re.I),
+    re.compile(rf">>?\s*{_SKILL_TPL}"),
+]
+# Repo-root templates/ — `\s+` in each verb pattern already anchors the path
+# directly after the verb's arguments, so `cp src foo/templates/bar` (which
+# writes to a project's own `templates/` dir, not the repo root) won't match.
+_REPO_TPL = r"(?:\./)?templates/[A-Za-z0-9_.-]+"
+_REPO_TEMPLATES_WRITE_PATTERNS = [
+    re.compile(rf"\bmkdir(?:\s+-\S+)*\s+{_REPO_TPL}", re.I),
+    re.compile(rf"\btee\s+(?:-\S+\s+)*{_REPO_TPL}", re.I),
+    re.compile(rf"\b(?:cp|mv|rsync)\s+\S+\s+{_REPO_TPL}", re.I),
+    re.compile(rf">>?\s*{_REPO_TPL}"),
+]
+
 _BASH_DENY_PATTERNS = [
     (re.compile(r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\b", re.I), "rm -rf is blocked"),
     (re.compile(r":\s*\(\s*\)\s*\{"), "fork bomb pattern blocked"),
@@ -258,9 +336,32 @@ class Session:
             try:
                 target.relative_to(proj)
             except ValueError:
-                return "writes outside the project root are not allowed"
+                # Writes are project-scoped — with one structural exception:
+                # the repo-root `templates/` tree (user-saved templates) is
+                # written to via the API, never directly. Any other path
+                # outside the project root is denied.
+                templates_root = (REPO_ROOT / "templates").resolve()
+                try:
+                    target.relative_to(templates_root)
+                    return (
+                        "edit templates/ via the API, not direct write: "
+                        "POST /api/templates {source_project, name, ...} "
+                        "or DELETE /api/templates/<name>"
+                    )
+                except ValueError:
+                    return "writes outside the project root are not allowed"
             if target.suffix.lower() == ".py":
                 return "editing .py files is not allowed in chat"
+            # The Workbench directive is structurally fragile (one corrupt
+            # write hides every registered deck). Force agents through the
+            # validated POST /output-dirs/register endpoint so existing
+            # entries can't be accidentally dropped and schemas can't drift.
+            if target.name == "output_dirs.json" and target.parent.resolve() == proj:
+                return (
+                    "edit output_dirs.json via the API, not direct write: "
+                    "POST /api/projects/<name>/output-dirs/register "
+                    "{dir, label?, set_current?}"
+                )
 
         if tool_name in _FILE_READ_TOOLS:
             raw = tool_input.get("file_path") or tool_input.get("path") or ""
@@ -277,6 +378,25 @@ class Session:
             for pat, reason in _BASH_DENY_PATTERNS:
                 if pat.search(cmd):
                     return reason
+            # The skill package's layout library and the user-template store are
+            # the two locations agents most often confuse with each other. Both
+            # are read-only from the chat surface — writes must go through the
+            # API. The patterns below match write DESTINATIONS only (so reading
+            # `cat skills/.../templates/foo.md` still works).
+            for pat in _SKILL_TEMPLATES_WRITE_PATTERNS:
+                if pat.search(cmd):
+                    return (
+                        "do not write to skills/ppt-master/templates/ — that's the "
+                        "skill's own layout library, not the user-template store. "
+                        "Use POST http://127.0.0.1:8787/api/templates instead."
+                    )
+            for pat in _REPO_TEMPLATES_WRITE_PATTERNS:
+                if pat.search(cmd):
+                    return (
+                        "do not write to templates/ directly — use the API: "
+                        "POST http://127.0.0.1:8787/api/templates "
+                        "{source_project, name, description, include_images}"
+                    )
 
         return None
 

@@ -7,9 +7,13 @@ type Tab = "workbench" | "files";
 export function PreviewPanel({
   project,
   onAskAi,
+  onSendAi,
 }: {
   project: string;
   onAskAi?: (text: string) => void;
+  // Dispatch a chat message immediately, bypassing the textarea. Used by the
+  // Export button so a single click both authors the prompt and runs it.
+  onSendAi?: (text: string) => void;
 }) {
   const [tab, setTab] = useState<Tab>("workbench");
 
@@ -28,7 +32,7 @@ export function PreviewPanel({
       </div>
       <div className="flex-1 min-h-0">
         {tab === "workbench" ? (
-          <Workbench project={project} onAskAi={onAskAi} />
+          <Workbench project={project} onAskAi={onAskAi} onSendAi={onSendAi} />
         ) : (
           <ProjectFiles project={project} onAskAi={onAskAi} />
         )}

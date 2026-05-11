@@ -308,7 +308,7 @@ function SessionShell({
   // SVG-editor → chat handoff. SlideEditor builds a context-rich draft when
   // the user hits "Ask AI" on a selected element; ChatPanel watches the nonce
   // and refills its textarea so the user can review and send.
-  const [composeReq, setComposeReq] = useState<{ text: string; nonce: number } | null>(null);
+  const [composeReq, setComposeReq] = useState<{ text: string; nonce: number; autoSend?: boolean } | null>(null);
 
   // Hydrate the agent stream's event list with whatever we restored from the
   // selected thread's localStorage snapshot — runs once per remount.
@@ -361,6 +361,7 @@ function SessionShell({
           <PreviewPanel
             project={session.project}
             onAskAi={(text) => setComposeReq({ text, nonce: Date.now() })}
+            onSendAi={(text) => setComposeReq({ text, nonce: Date.now(), autoSend: true })}
           />
         </main>
       </div>

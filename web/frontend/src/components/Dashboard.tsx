@@ -1,10 +1,21 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type PermissionMode = "auto" | "confirm";
 type Format = "ppt169" | "ppt43" | "a4portrait";
 type Filter = "recent" | "yours";
+type Tab = "projects" | "templates";
 
 type ProjectMeta = { name: string; slides: number; exports?: number; mtime?: number };
+
+type TemplateMeta = {
+  name: string;
+  description: string;
+  source_project: string;
+  format: string;
+  created_at: number;
+  has_thumbnail: boolean;
+  brand_files: string[];
+};
 
 const FORMAT_LABELS: Record<Format, string> = {
   ppt169: "PPT 16:9 — Slide deck",
@@ -33,6 +44,36 @@ export function Dashboard({
   const [format, setFormat] = useState<Format>("ppt169");
   const [filter, setFilter] = useState<Filter>("yours");
   const [search, setSearch] = useState("");
+  const [tab, setTab] = useState<Tab>("projects");
+
+  // Templates state lives here so the count badge on the tab stays accurate
+  // and we don't pay a refetch every time the user toggles tabs.
+  const [templates, setTemplates] = useState<TemplateMeta[]>([]);
+  const [templatesError, setTemplatesError] = useState<string | null>(null);
+  const [templatesLoading, setTemplatesLoading] = useState(false);
+  const [templatesRefresh, setTemplatesRefresh] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setTemplatesLoading(true);
+    fetch("/api/templates")
+      .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
+      .then((d) => {
+        if (cancelled) return;
+        setTemplates(d.templates ?? []);
+        setTemplatesError(null);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setTemplatesError(String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setTemplatesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [templatesRefresh]);
 
   const filtered = useMemo(() => {
     const list = existing.slice().sort((a, b) => (b.mtime ?? 0) - (a.mtime ?? 0));
@@ -43,6 +84,16 @@ export function Dashboard({
     if (filter === "recent") return matched.slice(0, 6);
     return matched;
   }, [existing, search, filter]);
+
+  const filteredTemplates = useMemo(() => {
+    const trimmed = search.trim().toLowerCase();
+    if (!trimmed) return templates;
+    return templates.filter(
+      (t) =>
+        t.name.toLowerCase().includes(trimmed) ||
+        t.description.toLowerCase().includes(trimmed),
+    );
+  }, [templates, search]);
 
   return (
     <div className="h-full flex bg-[#FBF7F1]">
@@ -142,50 +193,103 @@ export function Dashboard({
       </aside>
 
       <main className="flex-1 flex flex-col min-w-0">
-        <div className="px-8 pt-6 pb-2 flex items-baseline gap-3">
-          <h1 className="text-xl font-semibold text-gray-900">Projects</h1>
-          <span className="text-[12px] text-gray-400">
-            {existing.length} total
-          </span>
+        <div className="px-8 pt-6 pb-2 flex items-center gap-4">
+          <TabButton active={tab === "projects"} onClick={() => setTab("projects")}>
+            Projects
+            <span className="ml-1.5 text-[11px] text-gray-400 font-normal">
+              {existing.length}
+            </span>
+          </TabButton>
+          <TabButton active={tab === "templates"} onClick={() => setTab("templates")}>
+            Templates
+            <span className="ml-1.5 text-[11px] text-gray-400 font-normal">
+              {templates.length}
+            </span>
+          </TabButton>
         </div>
 
         <div className="px-8 py-3 flex items-center gap-3 border-b border-[#EFE6D6]">
-          <div className="inline-flex bg-[#FFE7DA] rounded-full p-0.5 text-[12px]">
-            <FilterChip active={filter === "recent"} onClick={() => setFilter("recent")}>
-              Recent
-            </FilterChip>
-            <FilterChip active={filter === "yours"} onClick={() => setFilter("yours")}>
-              All
-            </FilterChip>
-          </div>
+          {tab === "projects" ? (
+            <div className="inline-flex bg-[#FFE7DA] rounded-full p-0.5 text-[12px]">
+              <FilterChip active={filter === "recent"} onClick={() => setFilter("recent")}>
+                Recent
+              </FilterChip>
+              <FilterChip active={filter === "yours"} onClick={() => setFilter("yours")}>
+                All
+              </FilterChip>
+            </div>
+          ) : (
+            <div className="text-[11px] text-gray-500 italic">
+              Reusable design DNA — open a project and ask the agent to "save this as a template" to add one.
+            </div>
+          )}
           <div className="ml-auto relative w-72">
             <SearchIcon className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search…"
+              placeholder={tab === "projects" ? "Search projects…" : "Search templates…"}
               className="w-full pl-8 pr-3 py-1.5 text-sm border border-gray-200 rounded-full bg-white focus:outline-none focus:border-brand-green"
             />
           </div>
         </div>
 
         <div className="flex-1 overflow-y-auto px-8 pb-8 pt-4">
-          {filtered.length === 0 ? (
-            <div className="text-sm text-gray-500 italic py-12 text-center">
-              {search.trim()
-                ? `No projects match "${search}".`
-                : "No projects yet — create one on the left to get started."}
-            </div>
+          {tab === "projects" ? (
+            filtered.length === 0 ? (
+              <div className="text-sm text-gray-500 italic py-12 text-center">
+                {search.trim()
+                  ? `No projects match "${search}".`
+                  : "No projects yet — create one on the left to get started."}
+              </div>
+            ) : (
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-4">
+                {filtered.map((p) => (
+                  <ProjectCard key={p.name} project={p} onOpen={() => onOpen(p.name)} />
+                ))}
+              </div>
+            )
           ) : (
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-4">
-              {filtered.map((p) => (
-                <ProjectCard key={p.name} project={p} onOpen={() => onOpen(p.name)} />
-              ))}
-            </div>
+            <TemplatesGrid
+              templates={filteredTemplates}
+              loading={templatesLoading}
+              error={templatesError}
+              search={search}
+              defaultPermissionMode={permissionMode}
+              existingProjectNames={existing.map((p) => p.name)}
+              onCreated={(projectName) => {
+                setTemplatesRefresh((n) => n + 1);
+                onOpen(projectName);
+              }}
+              onDeleted={() => setTemplatesRefresh((n) => n + 1)}
+            />
           )}
         </div>
       </main>
     </div>
+  );
+}
+
+function TabButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`text-base font-semibold py-1 border-b-2 transition ${
+        active
+          ? "text-gray-900 border-[#E8A78A]"
+          : "text-gray-400 border-transparent hover:text-gray-600"
+      }`}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -216,6 +320,271 @@ function ProjectCard({
         </div>
       </div>
     </button>
+  );
+}
+
+function TemplatesGrid({
+  templates,
+  loading,
+  error,
+  search,
+  defaultPermissionMode,
+  existingProjectNames,
+  onCreated,
+  onDeleted,
+}: {
+  templates: TemplateMeta[];
+  loading: boolean;
+  error: string | null;
+  search: string;
+  defaultPermissionMode: PermissionMode;
+  existingProjectNames: string[];
+  onCreated: (projectName: string) => void;
+  onDeleted: () => void;
+}) {
+  const [picked, setPicked] = useState<TemplateMeta | null>(null);
+
+  if (loading && templates.length === 0) {
+    return <div className="text-sm text-gray-400 py-12 text-center">Loading templates…</div>;
+  }
+  if (error && templates.length === 0) {
+    return <div className="text-sm text-red-600 py-12 text-center">{error}</div>;
+  }
+  if (templates.length === 0) {
+    return (
+      <div className="text-sm text-gray-500 italic py-12 text-center">
+        {search.trim()
+          ? `No templates match "${search}".`
+          : "No templates saved yet — open a project and ask the agent to \"save this as a template\"."}
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-4">
+        {templates.map((t) => (
+          <TemplateCard
+            key={t.name}
+            template={t}
+            onUse={() => setPicked(t)}
+            onDelete={async () => {
+              if (!confirm(`Delete template "${t.name}"? Existing projects derived from it are not affected.`)) return;
+              try {
+                const res = await fetch(`/api/templates/${encodeURIComponent(t.name)}`, {
+                  method: "DELETE",
+                });
+                if (!res.ok) throw new Error(await res.text());
+                onDeleted();
+              } catch (e: any) {
+                alert(`Failed to delete: ${e.message || e}`);
+              }
+            }}
+          />
+        ))}
+      </div>
+      {picked && (
+        <CreateFromTemplateDialog
+          template={picked}
+          existingProjectNames={existingProjectNames}
+          permissionMode={defaultPermissionMode}
+          onClose={() => setPicked(null)}
+          onCreated={(projectName) => {
+            setPicked(null);
+            onCreated(projectName);
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+function TemplateCard({
+  template,
+  onUse,
+  onDelete,
+}: {
+  template: TemplateMeta;
+  onUse: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div className="bg-white border border-[#EFE6D6] rounded-lg overflow-hidden hover:border-[#E8A78A] hover:shadow-sm transition group flex flex-col">
+      <div className="bg-[#F2EBDD] aspect-[16/9] flex items-center justify-center text-[#C8B591] overflow-hidden">
+        {template.has_thumbnail ? (
+          <object
+            type="image/svg+xml"
+            data={`/api/templates/${encodeURIComponent(template.name)}/file?path=thumbnail.svg`}
+            className="w-full h-full pointer-events-none"
+            aria-label={`${template.name} preview`}
+          />
+        ) : (
+          <FolderIcon className="w-12 h-12" />
+        )}
+      </div>
+      <div className="p-3 flex-1 flex flex-col gap-1">
+        <div className="text-sm font-medium truncate" title={template.name}>
+          {template.name}
+        </div>
+        {template.description && (
+          <div className="text-[11px] text-gray-600 line-clamp-2" title={template.description}>
+            {template.description}
+          </div>
+        )}
+        <div className="text-[10px] text-gray-400 mt-auto pt-1 truncate" title={template.source_project}>
+          From {template.source_project || "—"} · {template.format || "ppt169"}
+          {template.brand_files.length > 0 && (
+            <> · {template.brand_files.length} brand asset{template.brand_files.length === 1 ? "" : "s"}</>
+          )}
+        </div>
+        <div className="flex items-center gap-1.5 mt-2">
+          <button
+            onClick={onUse}
+            className="flex-1 text-[12px] py-1.5 rounded bg-[#E8A78A] text-white hover:opacity-90"
+          >
+            Use template
+          </button>
+          <button
+            onClick={onDelete}
+            className="text-[12px] py-1.5 px-2 rounded border border-gray-200 text-gray-500 hover:bg-red-50 hover:text-red-600 hover:border-red-200"
+            title="Delete template"
+          >
+            ×
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CreateFromTemplateDialog({
+  template,
+  existingProjectNames,
+  onClose,
+  onCreated,
+}: {
+  template: TemplateMeta;
+  existingProjectNames: string[];
+  permissionMode: PermissionMode;
+  onClose: () => void;
+  onCreated: (projectName: string) => void;
+}) {
+  // Pre-fill with a sensible default the user is likely to keep: the template
+  // name slug + today's date keeps things unique without forcing the user to
+  // think about naming up front.
+  const today = useMemo(() => {
+    const d = new Date();
+    return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+  }, []);
+  const [name, setName] = useState(`${template.name}_${today}`);
+  const [fmt, setFmt] = useState<Format>(
+    (template.format as Format) in FORMAT_LABELS ? (template.format as Format) : "ppt169",
+  );
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const taken = existingProjectNames.includes(name.trim());
+  const valid = !!name.trim() && !taken;
+
+  async function submit() {
+    if (!valid) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const res = await fetch("/api/projects/from-template", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          template: template.name,
+          project_name: name.trim(),
+          format: fmt,
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(body || res.statusText);
+      }
+      const data = await res.json();
+      onCreated(data.project);
+    } catch (e: any) {
+      setErr(String(e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/30 flex items-center justify-center px-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white rounded-lg shadow-xl w-[460px] max-w-full"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-5 pt-5 pb-3 border-b border-gray-100">
+          <div className="text-base font-semibold">Create project from template</div>
+          <div className="text-[12px] text-gray-500 mt-0.5 truncate" title={template.name}>
+            Template: <span className="font-mono">{template.name}</span>
+          </div>
+        </div>
+        <div className="px-5 py-4 space-y-3">
+          <div>
+            <label className="block text-[11px] font-medium text-gray-500 mb-1">
+              New project name
+            </label>
+            <input
+              autoFocus
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="w-full border border-gray-200 rounded px-3 py-2 text-sm focus:outline-none focus:border-brand-green"
+            />
+            {taken && (
+              <div className="text-[11px] text-red-600 mt-1">
+                A project with this name already exists.
+              </div>
+            )}
+          </div>
+          <div>
+            <label className="block text-[11px] font-medium text-gray-500 mb-1">
+              Canvas format
+            </label>
+            <select
+              value={fmt}
+              onChange={(e) => setFmt(e.target.value as Format)}
+              className="w-full border border-gray-200 rounded px-3 py-2 text-sm bg-white"
+            >
+              {(Object.keys(FORMAT_LABELS) as Format[]).map((f) => (
+                <option key={f} value={f}>
+                  {FORMAT_LABELS[f]}
+                </option>
+              ))}
+            </select>
+            {template.format && template.format !== fmt && (
+              <div className="text-[11px] text-amber-700 mt-1">
+                Heads up: this template was captured as <span className="font-mono">{template.format}</span>. Overriding the format may break alignments.
+              </div>
+            )}
+          </div>
+          {err && <div className="text-[12px] text-red-600">{err}</div>}
+        </div>
+        <div className="px-5 pb-5 pt-1 flex items-center justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="text-sm px-3 py-1.5 rounded border border-gray-200 text-gray-700 hover:bg-gray-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={submit}
+            disabled={!valid || busy}
+            className="text-sm px-3 py-1.5 rounded bg-[#E8A78A] text-white disabled:opacity-60 hover:opacity-90"
+          >
+            {busy ? "Creating…" : "Create & open"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -265,7 +634,6 @@ function DeckLogo() {
 }
 
 export function DeckIcon({ className }: { className?: string }) {
-  // Brand mark — used wherever the app needs an inline logo.
   return (
     <img
       src="/logo.png"

@@ -10,7 +10,11 @@ import {
 
 type Props = {
   project: string;
-  file: string;
+  // Project-relative slide path, e.g. `svg_output/01.svg` or
+  // `flashcards/templates/A_clean_front.svg`. We use it for both GET (via
+  // `/file?path=`) and POST (via `/svg-save?path=`) so the editor works
+  // identically across every registered working dir.
+  path: string;
   cacheKey: string;
   editing: boolean;
   onDirtyChange?: (dirty: boolean) => void;
@@ -204,7 +208,7 @@ type TextEdit = {
 export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEditor(
   {
     project,
-    file,
+    path,
     cacheKey,
     editing,
     onDirtyChange,
@@ -216,9 +220,13 @@ export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEd
   },
   ref,
 ) {
+  // `file` (basename) is kept around for chat-context strings — agents are
+  // happier referencing "01.svg" than "svg_output/01.svg" when both sides
+  // already know the dir.
+  const file = useMemo(() => path.split("/").pop() ?? path, [path]);
   const url = useMemo(
-    () => `/api/projects/${encodeURIComponent(project)}/svg/${file}?v=${cacheKey}`,
-    [project, file, cacheKey],
+    () => `/api/projects/${encodeURIComponent(project)}/file?path=${encodeURIComponent(path)}&v=${cacheKey}`,
+    [project, path, cacheKey],
   );
   const hostRef = useRef<HTMLDivElement>(null);          // div that *contains* the inline svg
   const [svgOpen, setSvgOpen] = useState<string>("");
@@ -463,7 +471,7 @@ export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEd
     setSaveErr(null);
     try {
       const res = await fetch(
-        `/api/projects/${encodeURIComponent(project)}/svg/${file}`,
+        `/api/projects/${encodeURIComponent(project)}/svg-save?path=${encodeURIComponent(path)}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -505,7 +513,7 @@ export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEd
       .catch((e) => setLoadErr(String(e)));
   }
 
-  useImperativeHandle(ref, () => ({ save, revert, undo, redo }), [file, project, svgInner, url]);
+  useImperativeHandle(ref, () => ({ save, revert, undo, redo }), [path, project, svgInner, url]);
 
   // ⌘/Ctrl + S to save, ⌘/Ctrl + Z / ⇧⌘Z (or ⌘Y) for undo/redo while editing.
   useEffect(() => {
@@ -528,7 +536,7 @@ export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEd
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [editing, file, project, svgInner]);
+  }, [editing, path, project, svgInner]);
 
   // Focus the overlay input as soon as a text edit starts.
   const overlayInputRef = useRef<HTMLTextAreaElement>(null);

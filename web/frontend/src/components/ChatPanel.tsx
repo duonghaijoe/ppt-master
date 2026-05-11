@@ -21,7 +21,9 @@ type AttachedFile = {
 type PermissionMode = "auto" | "confirm";
 type ModelTier = "auto" | "light" | "general" | "premium";
 
-type ComposeRequest = { text: string; nonce: number };
+// `autoSend` triggers an immediate dispatch (Export button etc.) instead of
+// the default behavior of prefilling the textarea for the user to review.
+type ComposeRequest = { text: string; nonce: number; autoSend?: boolean };
 
 type ProjectRef = { name: string; slides?: number; mtime?: number };
 
@@ -118,9 +120,26 @@ export function ChatPanel({
   // SVG editor → chat handoff: the slide editor builds a context-rich draft
   // ("element X at … please …") and bumps a nonce. We append (or replace if
   // the textarea is empty) and focus, so the user reviews before sending.
+  //
+  // `autoSend` skips that review step — used by the Export button so a single
+  // click both authors the prompt and dispatches it.
   useEffect(() => {
     if (!composeRequest) return;
     const incoming = composeRequest.text;
+    if (composeRequest.autoSend) {
+      // Don't touch the textarea state — preserve whatever the user was
+      // typing. Dispatch directly with no attachments/refs.
+      atBottomRef.current = true;
+      if (streaming) {
+        // Queue behind whatever's already running; the queue drain effect
+        // will pick it up exactly like a manually-typed message.
+        setQueue((q) => [...q, incoming]);
+      } else {
+        void dispatchMessage(incoming, [], []);
+      }
+      onComposeConsumed?.();
+      return;
+    }
     setInput((prev) => (prev.trim() ? prev.trimEnd() + "\n\n" + incoming : incoming));
     requestAnimationFrame(() => {
       const ta = taRef.current;
@@ -256,6 +275,22 @@ export function ChatPanel({
     queuedRefs: string[],
   ) {
     let preface = "";
+    // Tell the agent which working dir the user is looking at. The Workbench
+    // also POSTs /output-dirs/current when the user picks a deck, so the two
+    // stay in sync — but read at send time so a deck flip just before submit
+    // still wins. Best-effort; if the directive 404s we just send without it.
+    try {
+      const res = await fetch(
+        `/api/projects/${encodeURIComponent(currentProject)}/output-dirs`,
+      );
+      if (res.ok) {
+        const data = await res.json();
+        const cur = String(data.current || "").trim();
+        if (cur) preface += `[output dir: ${cur}]\n\n`;
+      }
+    } catch {
+      /* non-fatal — fall through */
+    }
     if (queuedRefs.length > 0) {
       preface +=
         "References (read-only — sibling projects you may consult for design " +
@@ -1200,24 +1235,27 @@ function groupEvents(events: AgentEvent[]): RenderBlock[] {
   return blocks;
 }
 
-const TOOL_LABELS: Record<string, string> = {
-  Read: "Reading",
-  NotebookRead: "Reading",
-  Write: "Writing",
-  Edit: "Editing",
-  MultiEdit: "Editing",
-  NotebookEdit: "Editing",
-  Bash: "Running",
-  Glob: "Searching",
-  Grep: "Searching",
-  WebFetch: "Fetching",
-  WebSearch: "Searching",
-  TodoWrite: "Planning",
-  Task: "Delegating",
+const TOOL_LABELS: Record<string, [string, string]> = {
+  // [in-progress, completed]
+  Read: ["Reading", "Read"],
+  NotebookRead: ["Reading", "Read"],
+  Write: ["Writing", "Wrote"],
+  Edit: ["Editing", "Edited"],
+  MultiEdit: ["Editing", "Edited"],
+  NotebookEdit: ["Editing", "Edited"],
+  Bash: ["Running", "Ran"],
+  Glob: ["Searching", "Searched"],
+  Grep: ["Searching", "Searched"],
+  WebFetch: ["Fetching", "Fetched"],
+  WebSearch: ["Searching", "Searched"],
+  TodoWrite: ["Planning", "Planned"],
+  Task: ["Delegating", "Delegated"],
 };
 
-function friendlyLabel(name: string): string {
-  return TOOL_LABELS[name] ?? name;
+function friendlyLabel(name: string, done: boolean): string {
+  const pair = TOOL_LABELS[name];
+  if (!pair) return name;
+  return done ? pair[1] : pair[0];
 }
 
 function inputSummary(input: unknown): string {
@@ -1243,7 +1281,7 @@ function ToolCluster({ calls, busy }: { calls: ToolCall[]; busy: boolean }) {
   const [open, setOpen] = useState(false);
   const counts = new Map<string, number>();
   for (const c of calls) {
-    const label = friendlyLabel(c.name);
+    const label = friendlyLabel(c.name, c.result !== undefined);
     counts.set(label, (counts.get(label) ?? 0) + 1);
   }
   const summary = Array.from(counts.entries())

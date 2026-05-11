@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Presentation } from "lucide-react";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"]);
 const SVG_EXT = new Set(["svg"]);
@@ -141,7 +142,7 @@ export function FilePreview({
           </div>
         )}
         {isPdf && <embed src={url} type="application/pdf" className="w-full h-[80vh]" />}
-        {isPptx && <PptxPreview project={project} name={name} url={url} />}
+        {isPptx && <PptxPreview name={name} url={url} />}
         {isMd && (
           textErr ? (
             <div className="text-xs text-red-600">{textErr}</div>
@@ -195,84 +196,22 @@ export function FilePreview({
   );
 }
 
-type SlideMeta = { file: string; name: string; mtime: number };
-
-function PptxPreview({ project, name, url }: { project: string; name: string; url: string }) {
-  const [slides, setSlides] = useState<SlideMeta[] | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-  const [idx, setIdx] = useState(0);
-
-  useEffect(() => {
-    setSlides(null);
-    setErr(null);
-    setIdx(0);
-    fetch(`/api/projects/${encodeURIComponent(project)}/slides`)
-      .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
-      .then((d) => setSlides(d.slides ?? []))
-      .catch((e) => setErr(String(e)));
-  }, [project]);
-
-  if (err) return <div className="text-xs text-red-600">{err}</div>;
-  if (slides == null) return <div className="text-xs text-gray-400">loading…</div>;
-
-  if (slides.length === 0) {
-    return (
-      <div className="text-sm text-gray-500 space-y-2">
-        <div>
-          No rendered slides found in this project. The exported{" "}
-          <span className="font-mono">{name}</span> can still be downloaded.
-        </div>
-        <a href={url} className="text-brand-green underline" target="_blank" rel="noreferrer">
-          Download .pptx
-        </a>
-      </div>
-    );
-  }
-
-  const safeIdx = Math.min(idx, slides.length - 1);
-  const cur = slides[safeIdx];
-  const slideUrl = `/api/projects/${encodeURIComponent(project)}/svg/${cur.file}?v=${cur.mtime}`;
-
+// .pptx is a binary archive — no point trying to render it in-browser. The
+// SVGs that produced the deck are already first-class artifacts (rendered by
+// SlideDeck in their working dir), so this is just a download affordance.
+function PptxPreview({ name, url }: { name: string; url: string }) {
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between text-xs">
-        <div className="font-mono text-gray-600 truncate">
-          {cur.name}{" "}
-          <span className="text-gray-400">
-            {safeIdx + 1} / {slides.length}
-          </span>
-        </div>
-        <a href={url} className="text-brand-green hover:underline" target="_blank" rel="noreferrer">
-          Download .pptx
-        </a>
-      </div>
-      <div className="bg-white shadow" style={{ aspectRatio: "16 / 9", width: "min(100%, 1100px)" }}>
-        <object
-          type="image/svg+xml"
-          data={slideUrl}
-          className="w-full h-full"
-          aria-label={cur.name}
-        />
-      </div>
-      <div className="flex gap-2 overflow-x-auto pb-1">
-        {slides.map((s, i) => (
-          <button
-            key={s.file}
-            onClick={() => setIdx(i)}
-            className={`shrink-0 w-28 h-16 border rounded overflow-hidden ${
-              i === safeIdx ? "border-brand-green ring-2 ring-brand-green/30" : "border-gray-200"
-            }`}
-            style={{ aspectRatio: "16 / 9" }}
-            title={s.name}
-          >
-            <object
-              type="image/svg+xml"
-              data={`/api/projects/${encodeURIComponent(project)}/svg/${s.file}?v=${s.mtime}`}
-              className="w-full h-full pointer-events-none"
-            />
-          </button>
-        ))}
-      </div>
-    </div>
+    <a
+      href={url}
+      target="_blank"
+      rel="noreferrer"
+      className="inline-flex items-center gap-3 px-4 py-3 bg-white border border-gray-200 rounded hover:border-brand-green/40 hover:bg-brand-green/5 text-sm"
+    >
+      <Presentation className="w-6 h-6 text-orange-500 shrink-0" />
+      <span className="flex flex-col">
+        <span className="font-mono text-gray-700">{name}</span>
+        <span className="text-xs text-gray-400">PowerPoint export · click to download</span>
+      </span>
+    </a>
   );
 }
