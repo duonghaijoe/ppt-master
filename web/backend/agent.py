@@ -54,6 +54,9 @@ GUARDRAIL_SUFFIX = """\
   templates). Reads outside the repo will be denied.
 - Bash commands that try to leave the repo, write to `.py` files, run as
   root, or pipe remote content into a shell will be denied.
+- You are bound to one tenant for this session. Reads and writes that
+  touch a different tenant's tree (`tenants/<other-slug>/...`) are denied,
+  including via Bash. Stay inside your active project.
 - In every reply, refer to files by project-relative paths
   (e.g. `sources/foo.md`). Never paste absolute filesystem paths.
 
@@ -214,6 +217,11 @@ _REPO_TEMPLATES_WRITE_PATTERNS = [
     re.compile(rf">>?\s*{_REPO_TPL}"),
 ]
 
+# Tenant cross-reference: any `tenants/<slug>/` mention in a Bash command.
+# Used to deny commands that touch a tenant other than the session's own.
+# Slugs follow the same charset as ``_safe_slug`` in files.py.
+_TENANT_PATH_PATTERN = re.compile(r"\btenants/([A-Za-z0-9_-]+)/")
+
 _BASH_DENY_PATTERNS = [
     (re.compile(r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\b", re.I), "rm -rf is blocked"),
     (re.compile(r":\s*\(\s*\)\s*\{"), "fork bomb pattern blocked"),
@@ -261,6 +269,12 @@ def _block_to_dict(block) -> Optional[dict]:
 class Session:
     id: str
     project_path: Path
+    # Phase 3: every session is bound to a tenant + user. The sandbox uses
+    # these to scope writes to ``tenants/<tenant_slug>/`` and deny cross-tenant
+    # reads. Legacy callers that don't supply them resolve under the default
+    # tenant for backwards compatibility.
+    tenant_slug: str = "default"
+    user_id: str = ""
     client: Optional[ClaudeSDKClient] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # "auto" → SDK acceptEdits (no prompts).
@@ -318,6 +332,27 @@ class Session:
         except Exception:
             return None
 
+    def _tenant_root(self) -> Path:
+        """``<repo>/tenants/<self.tenant_slug>`` resolved."""
+        return (REPO_ROOT / "tenants" / self.tenant_slug).resolve()
+
+    def _is_other_tenant_path(self, target: Path) -> bool:
+        """True when ``target`` lives under a tenants/<slug>/ other than ours.
+
+        Used to deny cross-tenant reads and writes: an agent in tenant ``acme``
+        must not be able to ``cat tenants/globex/projects/foo.md``. Paths above
+        ``tenants/`` (skills/, assets/, examples/) aren't in any tenant's tree
+        and stay readable as platform-shared resources.
+        """
+        tenants_root = (REPO_ROOT / "tenants").resolve()
+        try:
+            rel = target.relative_to(tenants_root)
+        except ValueError:
+            return False
+        if not rel.parts:
+            return False
+        return rel.parts[0] != self.tenant_slug
+
     def _sandbox_deny(self, tool_name: str, tool_input) -> Optional[str]:
         """Return a short deny reason if the call violates project sandbox.
 
@@ -329,12 +364,18 @@ class Session:
             return None
         proj = self.project_path.resolve()
         repo = REPO_ROOT.resolve()
+        tenant_root = self._tenant_root()
 
         if tool_name in _FILE_EDIT_TOOLS:
             raw = tool_input.get("file_path") or tool_input.get("path") or ""
             target = self._resolve(raw)
             if target is None:
                 return None
+            # Phase 3: cross-tenant writes are categorically denied — even
+            # before considering project containment. An agent in tenant A
+            # cannot write anything under tenants/B/.
+            if self._is_other_tenant_path(target):
+                return "cross-tenant writes are not allowed"
             try:
                 target.relative_to(proj)
             except ValueError:
@@ -342,13 +383,13 @@ class Session:
                 # the tenant `templates/` tree (user-saved templates) is
                 # written to via the API, never directly. Any other path
                 # outside the project root is denied.
-                templates_root = (REPO_ROOT / "tenants" / "default" / "templates").resolve()
+                templates_root = (tenant_root / "templates").resolve()
                 try:
                     target.relative_to(templates_root)
                     return (
                         "edit templates/ via the API, not direct write: "
-                        "POST /api/templates {source_project, name, ...} "
-                        "or DELETE /api/templates/<name>"
+                        "POST /api/tenants/<t>/templates {source_project, name, ...} "
+                        "or DELETE /api/tenants/<t>/templates/<name>"
                     )
                 except ValueError:
                     return "writes outside the project root are not allowed"
@@ -361,7 +402,7 @@ class Session:
             if target.name == "output_dirs.json" and target.parent.resolve() == proj:
                 return (
                     "edit output_dirs.json via the API, not direct write: "
-                    "POST /api/projects/<name>/output-dirs/register "
+                    "POST /api/tenants/<t>/projects/<name>/output-dirs/register "
                     "{dir, label?, set_current?}"
                 )
 
@@ -374,6 +415,11 @@ class Session:
                 target.relative_to(repo)
             except ValueError:
                 return "reading outside the repository is not allowed"
+            # Phase 3: cross-tenant reads denied. Platform-scope paths
+            # (skills/, assets/, examples/, docs/) live above tenants/ and
+            # remain readable.
+            if self._is_other_tenant_path(target):
+                return "cross-tenant reads are not allowed"
 
         if tool_name == "Bash":
             cmd = tool_input.get("command", "") or ""
@@ -390,15 +436,23 @@ class Session:
                     return (
                         "do not write to skills/ppt-master/templates/ — that's the "
                         "skill's own layout library, not the user-template store. "
-                        "Use POST http://127.0.0.1:8787/api/templates instead."
+                        "Use POST http://127.0.0.1:8787/api/tenants/<t>/templates instead."
                     )
             for pat in _REPO_TEMPLATES_WRITE_PATTERNS:
                 if pat.search(cmd):
                     return (
                         "do not write to templates/ directly — use the API: "
-                        "POST http://127.0.0.1:8787/api/templates "
+                        "POST http://127.0.0.1:8787/api/tenants/<t>/templates "
                         "{source_project, name, description, include_images}"
                     )
+            # Bash cross-tenant guard: deny any mention of another tenant's
+            # directory. Cheap pattern match — finds `tenants/<other>/...` even
+            # in pipelines, redirects, and quoted args. Reading or writing
+            # the current tenant's tree is unaffected.
+            for m in _TENANT_PATH_PATTERN.finditer(cmd):
+                slug = m.group(1)
+                if slug and slug != self.tenant_slug:
+                    return f"cross-tenant path tenants/{slug}/ is denied"
 
         return None
 
@@ -576,9 +630,20 @@ class SessionRegistry:
         self._sessions: dict[str, Session] = {}
         self._lock = asyncio.Lock()
 
-    async def create(self, project_path: Path) -> Session:
+    async def create(
+        self,
+        project_path: Path,
+        *,
+        tenant_slug: str = "default",
+        user_id: str = "",
+    ) -> Session:
         sid = uuid.uuid4().hex[:12]
-        session = Session(id=sid, project_path=project_path)
+        session = Session(
+            id=sid,
+            project_path=project_path,
+            tenant_slug=tenant_slug,
+            user_id=user_id,
+        )
         async with self._lock:
             self._sessions[sid] = session
         return session

@@ -28,13 +28,27 @@ import shutil
 import time
 from pathlib import Path
 
-from files import DEFAULT_TENANT_ROOT, PROJECTS_DIR, REPO_ROOT, project_path, safe_rel
+from files import (
+    DEFAULT_TENANT_ROOT,
+    PROJECTS_DIR,
+    REPO_ROOT,
+    TENANTS_ROOT,
+    _safe_slug,
+    project_path,
+    safe_rel,
+)
 
 
-# Templates live under the default tenant root in the post-Phase-1 layout. The
-# directory is created lazily by save_project_as_template; if it doesn't exist
-# yet (clean repos), reads just return [] as before.
+# Templates live under each tenant's root. Phase 3 makes the path tenant-aware;
+# legacy single-arg callers still resolve under the default tenant for backwards
+# compatibility. The directory is created lazily by save_project_as_template;
+# if it doesn't exist yet (clean repos), reads just return [] as before.
 TEMPLATES_DIR = DEFAULT_TENANT_ROOT / "templates"
+
+
+def tenant_templates_dir(slug: str) -> Path:
+    """``<repo>/tenants/<slug>/templates``."""
+    return TENANTS_ROOT / _safe_slug(slug) / "templates"
 
 # What we copy verbatim if it exists in the source project. The keys are
 # project-relative paths; bool indicates whether the entry is a directory.
@@ -70,9 +84,9 @@ def _sanitize_template_name(name: str) -> str:
     return n
 
 
-def _template_path(name: str) -> Path:
+def _template_path(name: str, slug: str = "default") -> Path:
     safe = _sanitize_template_name(name)
-    return TEMPLATES_DIR / safe
+    return tenant_templates_dir(slug) / safe
 
 
 def _safe_image_target(project: Path, rel: str) -> Path | None:
@@ -125,11 +139,12 @@ def _summarize(path: Path) -> dict:
     }
 
 
-def list_templates() -> list[dict]:
-    if not TEMPLATES_DIR.exists():
+def list_templates(slug: str = "default") -> list[dict]:
+    root = tenant_templates_dir(slug)
+    if not root.exists():
         return []
     out: list[dict] = []
-    for p in sorted(TEMPLATES_DIR.iterdir(), key=lambda x: x.name.lower()):
+    for p in sorted(root.iterdir(), key=lambda x: x.name.lower()):
         if not p.is_dir() or p.name.startswith("."):
             continue
         # Require at least a template.json so half-written entries don't
@@ -140,9 +155,9 @@ def list_templates() -> list[dict]:
     return out
 
 
-def read_template(name: str) -> dict:
+def read_template(name: str, slug: str = "default") -> dict:
     """Return template metadata; raises FileNotFoundError when missing."""
-    p = _template_path(name)
+    p = _template_path(name, slug)
     if not p.is_dir() or not (p / "template.json").exists():
         raise FileNotFoundError(name)
     return _summarize(p)
@@ -177,6 +192,7 @@ def save_project_as_template(
     name: str,
     description: str = "",
     include_images: list[str] | None = None,
+    slug: str = "default",
 ) -> dict:
     """Snapshot the design DNA of ``source_project`` into a reusable template.
 
@@ -189,14 +205,14 @@ def save_project_as_template(
         FileNotFoundError: source project doesn't exist.
         ValueError:        name fails validation, or template already exists.
     """
-    project = project_path(source_project)
+    project = project_path(source_project, slug)
     if not project.exists():
         raise FileNotFoundError(source_project)
-    target = _template_path(name)
+    target = _template_path(name, slug)
     if target.exists():
         raise ValueError(f"template {name!r} already exists; delete it first to replace")
 
-    TEMPLATES_DIR.mkdir(exist_ok=True)
+    tenant_templates_dir(slug).mkdir(parents=True, exist_ok=True)
     target.mkdir(parents=True)
 
     copied_brand: list[str] = []
@@ -251,15 +267,16 @@ def save_project_as_template(
     return _summarize(target)
 
 
-def delete_template(name: str) -> None:
-    p = _template_path(name)
+def delete_template(name: str, slug: str = "default") -> None:
+    p = _template_path(name, slug)
     if not p.is_dir():
         raise FileNotFoundError(name)
     # Guard against path escape — _template_path already sanitizes, but a
     # defensive containment check costs nothing and shields against future
     # refactors that loosen the name regex.
+    root = tenant_templates_dir(slug).resolve()
     try:
-        p.resolve().relative_to(TEMPLATES_DIR.resolve())
+        p.resolve().relative_to(root)
     except ValueError:
         raise ValueError(f"refusing to delete outside templates/: {name!r}")
     shutil.rmtree(p)
@@ -269,6 +286,7 @@ def create_project_from_template(
     template_name: str,
     project_name: str,
     fmt: str | None = None,
+    slug: str = "default",
 ) -> Path:
     """Initialize a new project pre-populated with the template's artifacts.
 
@@ -279,7 +297,7 @@ def create_project_from_template(
     """
     from files import init_project  # local import to avoid circulars
 
-    template = _template_path(template_name)
+    template = _template_path(template_name, slug)
     if not template.is_dir() or not (template / "template.json").exists():
         raise FileNotFoundError(template_name)
     meta = _read_metadata(template)
@@ -288,7 +306,7 @@ def create_project_from_template(
     if chosen_fmt not in {"ppt169", "ppt43", "a4portrait"}:
         raise ValueError(f"invalid format {chosen_fmt!r}")
 
-    project_dir = init_project(project_name, chosen_fmt)
+    project_dir = init_project(project_name, chosen_fmt, slug)
 
     # Layer template artifacts on top of the fresh scaffold. shutil.copytree
     # with dirs_exist_ok merges subtrees; copy2 overwrites individual files.
@@ -322,13 +340,13 @@ def create_project_from_template(
     return project_dir
 
 
-def template_file_path(name: str, rel: str) -> Path:
+def template_file_path(name: str, rel: str, slug: str = "default") -> Path:
     """Resolve a file under a template, refusing path escape.
 
     Used by the file-serving endpoint to render thumbnails / SKILL.md previews
     in the UI without giving callers free filesystem access.
     """
-    base = _template_path(name).resolve()
+    base = _template_path(name, slug).resolve()
     if not base.is_dir():
         raise FileNotFoundError(name)
     rel = (rel or "").lstrip("/")
