@@ -16,6 +16,11 @@ Last updated: 2026-05-11
 - Platform-level resources (`skills/`, `examples/`, `docs/`, scripts) are
   visible only to platform admins. The agent may read `skills/` as a tool
   reference, but tenants cannot inspect or modify it.
+- Every billable provider call (Claude, OpenAI image gen, future
+  providers) is metered per tenant and billed pass-through + margin
+  against a credit balance. Trial credits seed every new tenant. Caps
+  are mixed (soft warn, hard block). Top-ups happen via Stripe or
+  manual bank transfer recorded by platform admin.
 
 ## 2. Non-goals (defer to later iterations)
 
@@ -242,6 +247,32 @@ GET    /api/platform/admins                        # platform_admin only
 POST   /api/platform/admins                        # platform_admin only
 ```
 
+### 7.6 Billing and metering
+
+```
+GET    /api/tenants/{t}/billing                    # balance, trial remaining, mtd usage, caps
+GET    /api/tenants/{t}/billing/usage              # line items: ?project=&user=&from=&to=&provider=&model=
+GET    /api/tenants/{t}/billing/sessions           # top-N high-cost sessions, last 30d
+GET    /api/tenants/{t}/billing/invoices           # past invoices
+GET    /api/tenants/{t}/billing/transactions       # top-ups, manual credits, monthly charges
+PATCH  /api/tenants/{t}/billing/caps               # owner: soft cap; hard cap raise → platform_admin
+POST   /api/tenants/{t}/billing/topup              # owner: Stripe checkout session
+POST   /api/tenants/{t}/billing/portal             # owner: Stripe customer portal session
+
+POST   /api/platform/billing/credit                # platform_admin: manual credit (wire / adjustment)
+POST   /api/platform/billing/stripe/webhook        # stripe webhook ingress
+GET    /api/platform/pricing                       # active pricing table
+PUT    /api/platform/pricing                       # platform_admin: publish new pricing version (append-only)
+GET    /api/platform/pricing/history               # platform_admin: full version history
+
+POST   /api/tenants/{t}/projects/{p}/images/generate  # mediated image gen (writes UsageEvent, returns file path)
+```
+
+The image-gen route replaces the direct OpenAI call from the agent's
+shelled-out `image_gen.py`. The agent in web mode is steered to this
+route by its system prompt and tool docs; direct curl/python to OpenAI
+from agent Bash is denied by the sandbox.
+
 ## 8. Session and Agent Model
 
 Each session record holds:
@@ -355,6 +386,32 @@ of current grants is shown above the form.
 - Project cards show a shared-from-other-tenant badge when applicable.
 - "New project" form remains but writes into the active tenant.
 
+### 10.7 Billing surfaces
+
+Owner-only billing page under the tenant settings:
+
+- Header card: current balance, trial remaining, MTD spend, soft / hard
+  caps with progress bars.
+- Usage explorer: line items filterable by project, user, model,
+  provider, date range. Defaults to the current month.
+- Top-cost sessions table (last 30d), with deep links into chat
+  transcripts so an owner can see what a $5 session actually did.
+- Transactions log: top-ups (Stripe), manual credits (bank transfer
+  with reference), monthly invoice charges.
+- Payment controls: "Top up" button (Stripe Checkout), "Manage card"
+  (Stripe customer portal). Manual-pay tenants see "Contact billing"
+  with the platform's wire-transfer details instead.
+- Cap editor: soft cap is owner-editable; hard cap raise is a request
+  that platform admin approves out of band.
+
+Editors and viewers see a slimmer "Usage" page — their own MTD
+consumption only, no balances or payment controls.
+
+Per-session cost counter lives in the chat UI footer: "This session:
+$0.18 (Opus)". Updates after each `result` event lands. Keeps the user
+honest about model choice without forcing a confirmation modal on every
+turn.
+
 ## 11. Backend Module Changes
 
 ### 11.1 `files.py`
@@ -414,6 +471,49 @@ of current grants is shown above the form.
 - `require_platform_admin`.
 - `resolve_project_role(user, tenant, project)`.
 
+### 11.8 New module: `providers/`
+
+A thin per-provider package (`providers/anthropic.py`,
+`providers/openai.py`, ...) that:
+
+- Wraps every outbound provider call we bill for.
+- Returns both the provider response and a structured `Units` record
+  the metering layer can price.
+- Reads its API key from `platform/secrets` (env-backed for v1, vault
+  later). Tenants never see provider keys.
+
+For Anthropic chat we do *not* wrap the SDK — `agent.py` already streams
+events with usage in them. The metering layer reads those events
+directly. The `providers/` package handles the non-SDK calls (image gen
+today; embeddings, TTS, etc. when they land).
+
+### 11.9 New module: `metering.py`
+
+- `record_chat_usage(session, model, usage)` called from the
+  `agent.py` event loop on every `assistant` / `result` event.
+- `record_provider_call(session, provider, model, units, request_id)`
+  called from `providers/*` wrappers.
+- Loads the active pricing row, computes `upstream_cost_usd` and
+  `billed_cost_usd` (with current margin), appends a `UsageEvent` to
+  the ledger, updates the tenant's MTD spend cache.
+- Emits `billing.threshold` and `billing.cap_exceeded` events when the
+  tenant crosses its soft / hard caps mid-stream.
+
+### 11.10 New module: `billing.py`
+
+- Balance, trial, transactions, invoices.
+- Cap enforcement: `check_eligibility(tenant, estimated_cost_usd)`
+  called before any provider call. Rejects with HTTP 402 if hard cap
+  hit. The estimate uses rolling per-turn average for the active model;
+  conservative under-estimates are absorbed by margin.
+- Stripe Checkout session creation, customer-portal session, webhook
+  ingestion.
+- Platform-admin manual credit entry (`POST
+  /api/platform/billing/credit`).
+- Monthly invoice generation: cron-style job sums `usage_events` per
+  tenant for the period, creates Stripe invoice (auto-billed customers)
+  or marks an outstanding balance line (manual-pay customers).
+
 ## 12. Migration Plan
 
 We migrate in-place with a script. Existing state ends up inside a single
@@ -455,6 +555,9 @@ shippable PRs:
 
 Each phase ships independently. Verification at each step listed.
 
+Phases 1-2 are not prod-deployable (no role enforcement). First
+prod-eligible cut is Phase 3. First externally-billable cut is Phase 6.
+
 ### Phase 1 — Filesystem layer (no behaviour change)
 
 - Add `tenants/default/` and path-mapper.
@@ -482,34 +585,63 @@ Each phase ships independently. Verification at each step listed.
 - Verify: tenant agent can still read skills; tenants cannot list
   `platform/admins`.
 
-### Phase 5 — Tenant management UI
+### Phase 5 — Metering capture + image-gen mediation
+
+- New `providers/`, `metering.py`, `platform/billing.db`,
+  `platform/pricing.json`.
+- Wire `record_chat_usage()` into `agent.py`'s event loop.
+- Move image generation behind
+  `/api/tenants/{t}/projects/{p}/images/generate`; deny direct
+  OpenAI calls from agent Bash.
+- No UI yet; ledger fills in the background.
+- Verify: every chat turn writes a `UsageEvent`; every image generated
+  via the new route writes a `UsageEvent`; running totals reconcile
+  against Anthropic/OpenAI dashboards to ≤2% drift over a week.
+
+### Phase 6 — Billing UX, caps, payments
+
+- `billing.py` with balance, trial, caps, transactions.
+- Pre-call `check_eligibility()` enforcing hard cap (HTTP 402 path).
+- Mixed-cap behaviour: soft warn event + email + UI banner; hard block
+  with clean session checkpoint.
+- Stripe Checkout + customer portal + webhook.
+- Platform-admin manual credit endpoint.
+- Tenant billing page (§10.7) and per-session cost counter.
+- Verify: a tenant with $0 balance and $0 trial cannot start a session;
+  a tenant crossing soft cap mid-session gets a banner; manual wire
+  recorded by admin shows up in the tenant's balance within seconds.
+
+### Phase 7 — Tenant management UI
 
 - Tenant switcher, members page, design-system editor, shared asset
   uploader.
 - Templates tab becomes tenant-scoped in the UI.
 
-### Phase 6 — Cross-tenant sharing
+### Phase 8 — Cross-tenant sharing
 
 - Project `.project.json` ACL.
 - `/api/tenants/{t}/projects/{p}/share` endpoints.
 - Share dialog in the project header.
 
-### Phase 7 — Hardening / nice-to-haves
+### Phase 9 — Hardening / nice-to-haves
 
 - Audit log emission.
-- Rate limiting per tenant.
+- Rate limiting per tenant (cost-aware, not just request-count).
 - Quotas (max projects, max storage).
 - Soft delete + trash.
+- Monthly invoice cron job for auto-billed Stripe customers.
 
 ## 14. Open Questions
 
-1. Where do API keys for image generation live? Per tenant (so each can
-   bring its own) or shared at the platform level? Today they're env-only
-   on the host. Suggest: platform-level by default, optional override at
-   the tenant level via `tenants/<t>/secrets.json` (encrypted at rest).
+1. ~~Where do API keys for image generation live?~~ **Resolved
+   (2026-05-15):** all provider keys are platform-managed. Tenants do
+   not bring their own keys. Billing model is pass-through upstream
+   cost + margin, with multi-provider support (Anthropic, OpenAI,
+   future). See §17 Metering and Billing.
 2. Should we surface a "platform catalog" of templates that any tenant
    can fork? Useful for onboarding but introduces a publish/approve flow.
-   Defer to a later phase.
+   Defer to a later phase. Reserve `platform/templates/` in the layout
+   so the eventual move is non-breaking.
 3. Project rename within a tenant: do we lock it (current behaviour) or
    support it? Templates and exports reference the project directory name
    by string. A rename today would break sources. Decide before Phase 3.
@@ -520,6 +652,15 @@ Each phase ships independently. Verification at each step listed.
    raw paths.
 5. Domain mapping per tenant (custom URLs)? Out of scope for now; assume
    a single host with path-based routing.
+6. Margin shape: flat percentage, sliding by volume, or per-provider?
+   Recommend flat 20% to start; revisit when we have ≥10 paying tenants.
+7. Cache-hit billing: pass-through provider-discounted cache rates
+   (tenant captures the savings) or charge cache-miss rate and pocket
+   the difference? Recommend pass-through to align incentives with
+   prompt-caching investment in the agent layer.
+8. Negative-balance grace: what happens when a tenant's balance goes
+   negative and they don't top up? Suggest 30-day read-only grace,
+   then archival; no auto-delete.
 
 ## 15. Risks
 
@@ -538,6 +679,25 @@ Each phase ships independently. Verification at each step listed.
 - **Sessions outliving role changes**: if an owner demotes a user mid-
   session, the SSE stream keeps yielding. We re-check `role` on every
   message send and at every tool-permission boundary.
+- **Runaway agent cost**: a rogue or buggy session can drain a tenant's
+  balance — and ultimately the platform's upstream provider budget —
+  before anyone notices. Mitigated by (a) per-session hard ceiling
+  (configurable, default $5/session) that triggers a clean stop, (b)
+  tenant hard cap enforced pre-call via `check_eligibility()`, (c)
+  default tenant hard cap set low (e.g., $100/month) on creation, and
+  (d) a platform-wide kill switch on the metering layer that can pause
+  all sessions if aggregate upstream spend spikes past a threshold.
+- **Pricing drift**: provider raises prices, our cached pricing table
+  is stale, we lose margin (or worse, charge below cost). Mitigated by
+  a daily reconciliation job that compares metered `upstream_cost_usd`
+  to actual provider invoices and alerts platform admin on >2% drift.
+  Pricing updates land as new versioned rows; old `UsageEvent`s keep
+  their original `pricing_version` so historical bills don't shift.
+- **Stripe webhook trust**: webhooks must be signature-verified, and
+  the credit-ingestion path must be idempotent on Stripe event id —
+  otherwise a webhook replay double-credits a tenant. Same idempotency
+  for manual credit entries (admin-supplied reference is the dedup
+  key).
 
 ## 16. Acceptance Criteria for "Multi-Tenant Done"
 
@@ -554,11 +714,224 @@ Each phase ships independently. Verification at each step listed.
 - The migration script has been run against a copy of the current state
   and every existing project still exports successfully.
 
-## 17. Out of Scope (explicit)
+## 17. Metering and Billing
+
+Every billable provider call is metered per `(tenant, project, user,
+session, provider, model)` and billed pass-through upstream cost +
+margin. Tenants are charged in USD against a credit balance. The
+platform pays upstream providers directly and never exposes provider
+keys to tenants.
+
+### 17.1 Provider abstraction
+
+Pricing is provider-and-model specific and changes over time. Every
+billable call is recorded as a `UsageEvent`:
+
+```python
+@dataclass
+class UsageEvent:
+    id: str                       # uuid
+    tenant: str
+    project: str
+    user_id: str
+    session_id: Optional[str]
+    provider: str                 # "anthropic", "openai", ...
+    model: str                    # "claude-opus-4-7", "gpt-image-2", ...
+    kind: str                     # "chat", "image", "embedding", ...
+    units: dict                   # provider-specific: {input_tokens, output_tokens, cache_read, cache_creation} or {images, size}
+    upstream_cost_usd: Decimal    # what we paid the provider
+    billed_cost_usd: Decimal      # upstream_cost_usd * (1 + margin)
+    pricing_version: str          # which row of the pricing table applied
+    created_at: datetime
+    request_id: Optional[str]     # provider request id for reconciliation
+```
+
+The pricing table lives at `platform/pricing.json`, append-only and
+versioned:
+
+```json
+{
+  "version": "2026-05-15",
+  "margin": 0.20,
+  "providers": {
+    "anthropic": {
+      "claude-opus-4-7": {
+        "input_per_mtok": 15.00,
+        "output_per_mtok": 75.00,
+        "cache_read_per_mtok": 1.50,
+        "cache_creation_per_mtok": 18.75
+      }
+    },
+    "openai": {
+      "gpt-image-2": { "per_image_1024": 0.04 }
+    }
+  }
+}
+```
+
+Each `UsageEvent` records the `pricing_version` it used so historical
+bills stay stable across price changes.
+
+### 17.2 Capture points
+
+**Claude chat.** The agent SDK streams `assistant` and `result` events
+that already carry a `usage` block (`input_tokens`, `output_tokens`,
+`cache_creation_input_tokens`, `cache_read_input_tokens`). After each
+event lands in `agent.py`'s loop, `metering.record_chat_usage(session,
+model, usage)` writes a `UsageEvent`. No extra SDK calls.
+
+**Image generation.** Today the agent shells out to
+`skills/ppt-master/scripts/image_gen.py`, which calls OpenAI directly
+using whatever API key is in the host environment. That is fine when a
+developer runs Claude Code locally against the repo, but it bypasses
+metering when the same agent runs inside the multi-tenant FastAPI
+backend on behalf of a tenant user.
+
+We split the two contexts cleanly:
+
+| Context | Image-gen path | Key source | Metered? |
+|---|---|---|---|
+| **CLI / dev** — agent invoked outside the FastAPI server (terminal Claude Code, offline pipeline) | `python skills/.../image_gen.py` → direct OpenAI call | Developer's local `OPENAI_API_KEY` env | No, not billed |
+| **Web / tenant** — agent running inside a tenant session in the FastAPI backend | `POST /api/tenants/{t}/projects/{p}/images/generate` (loopback) → backend → OpenAI | Platform-managed key in `platform/secrets` | Yes, `UsageEvent` per image |
+
+In web mode, two enforcement layers stack:
+
+1. **Soft steer.** The agent's system prompt and tool docs in
+   `agent.py` route image requests to the API endpoint, not the
+   script. This is the default the agent reaches for, not a hard
+   guarantee.
+2. **Hard guarantee.** The session sandbox denies, from agent Bash:
+   - Direct execution of `image_gen.py` (any command line containing
+     that script path).
+   - Outbound network calls to `api.openai.com` and any other billable
+     provider host we proxy (Anthropic non-SDK endpoints, future
+     providers).
+
+   Both return the same redirect-style error the agent already sees
+   for `output_dirs.json`: "use the web API at
+   `/api/tenants/{t}/projects/{p}/images/generate`".
+
+The standalone script is not deleted — it stays useful for developer
+workflows and the offline doc-to-deck pipeline. It just cannot be the
+bypass route in the hosted product.
+
+**Future providers.** Same pattern — every outbound provider call goes
+through a thin `providers/<name>.py` wrapper that records the
+`UsageEvent` before returning.
+
+### 17.3 Ledger storage
+
+SQLite (WAL mode) at `platform/billing.db` for v1:
+
+- `usage_events` — append-only, indexed on `(tenant, created_at)` and
+  `(tenant, project, created_at)`.
+- `pricing_versions` — full history of the price table.
+- `credit_transactions` — top-ups, manual credits, monthly invoice
+  charges, refunds. Idempotent on `(source, source_id)`.
+- `tenant_billing` — per-tenant `{balance_usd, cap_soft_usd,
+  cap_hard_usd, trial_remaining_usd, trial_expires_at,
+  stripe_customer_id?, billing_email, payment_mode}` where
+  `payment_mode ∈ {"stripe_auto", "stripe_prepaid", "manual"}`.
+
+WAL mode handles concurrent writers safely at expected scale. Postgres
+migration is a row-by-row copy when we outgrow it.
+
+### 17.4 Balance, trial credits, caps
+
+**Trial credits.** Every new tenant gets `trial_remaining_usd = N`
+(default $20, settable by platform admin per tenant). Usage debits
+trial first, then `balance_usd`. Trial does not roll into balance and
+expires 90 days after tenant creation.
+
+**Mixed cap.** Each tenant carries:
+
+- `cap_soft_usd` — when MTD spend crosses 80% of this, the backend
+  emits a `billing.threshold` event. UI banners the owner and an email
+  goes to `billing_email`. No request is blocked.
+- `cap_hard_usd` — at 100%, new session creation and new message sends
+  are rejected with HTTP 402. In-flight tool calls in an open session
+  finish so the agent reaches a clean checkpoint; the SSE stream then
+  closes with a `billing.cap_exceeded` event the UI surfaces.
+
+Defaults at tenant creation: soft $80, hard $100. Owners can raise
+their own soft cap. Hard-cap raises require platform admin (prevents a
+compromised owner account from blowing past safety).
+
+**Eligibility pre-check.** Before any billable call:
+
+```python
+effective_remaining = trial_remaining_usd + balance_usd
+mtd = sum_billed_cost_usd_this_month(tenant)
+if mtd + estimated_cost > cap_hard_usd or estimated_cost > effective_remaining:
+    raise BillingBlocked(...)
+```
+
+The cost estimate uses a rolling average per-turn cost for the active
+model (Opus turns are ~10× Haiku turns, so a single number is too
+coarse). Under-estimates are absorbed by margin; chronic under-estimate
+on a specific model triggers a pricing-table review.
+
+### 17.5 Payments
+
+Two paths into `credit_transactions`, both crediting one `balance_usd`:
+
+**Stripe.**
+- *Prepaid top-up.* Owner buys $X of credits via Stripe Checkout. The
+  webhook lands a `credit_transactions` row with `source="stripe"`,
+  `source_id=checkout_session_id`. Tenants in `payment_mode =
+  "stripe_prepaid"` use this exclusively.
+- *Monthly auto-invoice.* Cron sums each `payment_mode="stripe_auto"`
+  tenant's `billed_cost_usd` for the period, creates a Stripe invoice,
+  and on payment-success webhook posts a balancing entry.
+
+Webhooks are signature-verified and idempotent on Stripe event id;
+replays don't double-credit.
+
+**Manual / bank transfer.** Platform admin records the incoming payment
+via `POST /api/platform/billing/credit` with `{tenant, amount_usd,
+reference, note}`. Same ledger effect, `source="manual"`,
+`source_id=reference` (admin-supplied; must be unique per tenant for
+idempotency). Tenants in `payment_mode="manual"` see a "Contact
+billing" UI with wire-transfer instructions instead of Stripe.
+
+Tenants can switch payment_mode at any time; switching wipes Stripe
+auto-invoice if disabling, no other side effects on existing balance.
+
+### 17.6 What gets surfaced
+
+Owner sees (full §10.7 page):
+- Balance, trial remaining, MTD spend, soft/hard caps with progress.
+- Usage explorer (line items, filterable).
+- Top-cost sessions list with chat-deep-links.
+- Transactions log.
+- Stripe Checkout + customer portal, or wire instructions.
+
+Editor / viewer sees:
+- A "Usage" page with their own MTD consumption — no balances, no
+  payment controls.
+
+All chat users see a per-session cost counter in the chat footer:
+"This session: $0.18 (Opus)". Updates after every `result` event.
+
+### 17.7 Out-of-scope for v1 (billing-specific)
+
+- Tax handling (VAT, sales tax). Stripe Tax integration layers in
+  later.
+- Refund / dispute UI beyond Stripe's dashboard.
+- Volume / tier pricing — flat margin to start.
+- Credit gifting between tenants.
+- Per-user spend caps inside a tenant (only tenant-level today).
+
+## 18. Out of Scope (explicit)
 
 - Real authentication (OIDC, SAML, magic links).
-- Billing and metering.
 - Per-tenant theming of the web app chrome.
 - Multi-region deployment.
 - Realtime collaboration (multiple users in the same chat).
 - API tokens for programmatic access.
+- Tax handling (VAT, sales tax). Stripe Tax can layer in later; v1
+  treats prices as USD inclusive.
+- Refund / dispute workflows beyond what Stripe's dashboard supports
+  out of the box.
+- BYOK (bring-your-own-key). Tenants do not supply provider keys.
+- Credits-as-currency / FX. Balances are always USD.
