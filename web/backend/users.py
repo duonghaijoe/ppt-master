@@ -247,3 +247,46 @@ def add_membership(user_id: str, tenant_slug: str, role: str) -> User | None:
     record["memberships"] = memberships
     _save_user(record)
     return get_or_create(record["id"], record.get("email", ""))
+
+
+def remove_membership(user_id: str, tenant_slug: str) -> User | None:
+    """Drop a single membership from a user record.
+
+    Returns the refreshed User, or None if the user file doesn't exist.
+    No-op (still returns the refreshed user) when the membership isn't there.
+    """
+    record = _load_user(user_id)
+    if record is None:
+        return None
+    memberships = [
+        m for m in (record.get("memberships") or [])
+        if m.get("tenant_slug") != tenant_slug
+    ]
+    record["memberships"] = memberships
+    _save_user(record)
+    return get_or_create(record["id"], record.get("email", ""))
+
+
+def find_by_email(email: str) -> User | None:
+    """Locate a stored user by email (case-insensitive).
+
+    Used by tenant member CRUD: the invite UI works in emails, not internal
+    ids. Returns None if no record exists yet — the caller decides whether
+    to surface "user not found" or to provision a placeholder.
+    """
+    if not email:
+        return None
+    uid = _find_user_id_by_email(email)
+    if not uid:
+        return None
+    record = _load_user(uid)
+    if record is None:
+        return None
+    return User(
+        id=record["id"],
+        email=record.get("email", ""),
+        display_name=record.get("display_name") or record["id"],
+        memberships=_coerce_memberships(record.get("memberships")),
+        platform_admin=bool(record.get("platform_admin")),
+        created_at=int(record.get("created_at") or 0),
+    )

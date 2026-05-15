@@ -12,10 +12,13 @@ from watchfiles import Change, awatch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+TENANTS_ROOT = REPO_ROOT / "tenants"
 # Default-tenant root. Phase 1 of the multi-tenant migration re-roots
 # projects/templates under tenants/default/ while keeping the public API
-# unchanged. Real multi-tenant routing lands in Phase 3.
-DEFAULT_TENANT_ROOT = REPO_ROOT / "tenants" / "default"
+# unchanged. Phase 3 layers tenant-scoped helpers on top — legacy single-arg
+# functions continue to resolve under the default tenant for backwards
+# compatibility.
+DEFAULT_TENANT_ROOT = TENANTS_ROOT / "default"
 PROJECTS_DIR = DEFAULT_TENANT_ROOT / "projects"
 SCRIPTS_DIR = REPO_ROOT / "skills" / "ppt-master" / "scripts"
 SOURCE_TO_MD_DIR = SCRIPTS_DIR / "source_to_md"
@@ -26,14 +29,45 @@ def _python_bin() -> str:
     return str(venv_python) if venv_python.exists() else "python3"
 
 
-def project_path(name: str) -> Path:
+def _safe_slug(slug: str) -> str:
+    """Refuse anything that could escape ``tenants/``.
+
+    The tenant-prefixed routes take ``slug`` straight from the URL. The role
+    dependency validates that the tenant exists before this is called, but
+    we still validate the characters as defense in depth — a slug containing
+    ``..`` would otherwise let a member of one tenant resolve paths inside
+    another via crafted URLs.
+    """
+    s = (slug or "").strip().strip("/")
+    if not s or s in {".", ".."} or "/" in s or "\\" in s:
+        raise ValueError(f"invalid tenant slug: {slug!r}")
+    return s
+
+
+def tenant_projects_dir(slug: str) -> Path:
+    """``<repo>/tenants/<slug>/projects``."""
+    return TENANTS_ROOT / _safe_slug(slug) / "projects"
+
+
+def project_path(name: str, slug: str = "default") -> Path:
+    """Resolve a project directory by name within a tenant.
+
+    ``slug`` defaults to ``"default"`` so single-arg callers (legacy routes,
+    Phase 1 code) keep their existing behaviour. New tenant-prefixed routes
+    pass an explicit slug.
+    """
     safe = name.strip().replace("/", "_").replace("..", "_")
-    return PROJECTS_DIR / safe
+    return tenant_projects_dir(slug) / safe
 
 
-def safe_rel(name: str, rel: str) -> Path:
-    """Resolve project_path(name) / rel, refusing path escape."""
-    base = project_path(name).resolve()
+def safe_rel(name: str, rel: str, slug: str = "default") -> Path:
+    """Resolve ``project_path(name, slug) / rel``, refusing path escape.
+
+    Same default-tenant convention as :func:`project_path`. The path-escape
+    guard compares ``base`` against the resolved target, so symlinks or
+    ``..`` segments that climb out of the project root are caught.
+    """
+    base = project_path(name, slug).resolve()
     rel = (rel or "").lstrip("/")
     target = (base / rel).resolve() if rel else base
     if base != target and base not in target.parents:
@@ -61,8 +95,8 @@ def _is_noise(rel: Path) -> bool:
     return any(part.startswith(".") or part in _NOISE_DIRS for part in rel.parts)
 
 
-def list_tree(name: str, rel: str = "") -> dict:
-    target = safe_rel(name, rel)
+def list_tree(name: str, rel: str = "", slug: str = "default") -> dict:
+    target = safe_rel(name, rel, slug)
     if not target.exists():
         raise FileNotFoundError(rel or "/")
     if target.is_file():
@@ -88,11 +122,11 @@ def list_tree(name: str, rel: str = "") -> dict:
     return {"type": "dir", "path": rel, "entries": entries}
 
 
-def list_slides(name: str) -> list[dict]:
-    return list_dir_slides(name, "svg_output")
+def list_slides(name: str, slug: str = "default") -> list[dict]:
+    return list_dir_slides(name, "svg_output", slug)
 
 
-def list_dir_slides(name: str, rel_dir: str) -> list[dict]:
+def list_dir_slides(name: str, rel_dir: str, slug: str = "default") -> list[dict]:
     """List `*.svg` files in a project subdirectory, sorted by name.
 
     Returns the same shape as list_slides for backwards compat — adds a `path`
@@ -102,7 +136,7 @@ def list_dir_slides(name: str, rel_dir: str) -> list[dict]:
     if not rel_dir:
         return []
     try:
-        target = safe_rel(name, rel_dir)
+        target = safe_rel(name, rel_dir, slug)
     except ValueError:
         return []
     if not target.exists() or not target.is_dir():
@@ -179,7 +213,7 @@ def _bootstrap_output_dirs(base: Path) -> dict:
     return {"current": current, "dirs": dirs}
 
 
-def read_output_dirs(name: str) -> dict:
+def read_output_dirs(name: str, slug: str = "default") -> dict:
     """Return the project's output_dirs directive, bootstrapping if missing.
 
     Schema: ``{"current": "<rel>", "dirs": [{"dir": "<rel>", "label": "..."}]}``.
@@ -187,7 +221,7 @@ def read_output_dirs(name: str) -> dict:
     creates (svg_output, svg_final, flashcards/templates, …). This reader
     does not auto-discover dirs — if it's not declared, the UI won't show it.
     """
-    base = project_path(name)
+    base = project_path(name, slug)
     if not base.exists():
         raise FileNotFoundError(name)
     f = base / "output_dirs.json"
@@ -222,7 +256,7 @@ def read_output_dirs(name: str) -> dict:
     return {"current": current, "dirs": dirs}
 
 
-def _sanitize_dirs(name: str, base: Path, dirs_in) -> list[dict]:
+def _sanitize_dirs(name: str, base: Path, dirs_in, slug: str = "default") -> list[dict]:
     """Coerce a raw dirs payload into validated [{dir,label}] entries.
 
     Drops empties, duplicates, non-string types, and paths that escape the
@@ -246,7 +280,7 @@ def _sanitize_dirs(name: str, base: Path, dirs_in) -> list[dict]:
             continue
         # Path containment guard — directive must point inside the project.
         try:
-            target = safe_rel(name, rel)
+            target = safe_rel(name, rel, slug)
         except ValueError:
             continue
         try:
@@ -291,17 +325,17 @@ def _atomic_write_directive(base: Path, payload: dict) -> None:
     os.replace(tmp, target)
 
 
-def write_output_dirs(name: str, data: dict) -> dict:
+def write_output_dirs(name: str, data: dict, slug: str = "default") -> dict:
     """Persist a sanitized output_dirs directive and return what got written.
 
     Replaces the whole directive. Prefer ``register_output_dir`` when you just
     want to append a single entry — it avoids the "agent forgot existing
     entries" failure mode entirely.
     """
-    base = project_path(name)
+    base = project_path(name, slug)
     if not base.exists():
         raise FileNotFoundError(name)
-    dirs = _sanitize_dirs(name, base, data.get("dirs"))
+    dirs = _sanitize_dirs(name, base, data.get("dirs"), slug)
     if not dirs:
         raise ValueError("output_dirs requires at least one dir")
     current = str(data.get("current") or "").strip("/")
@@ -317,6 +351,7 @@ def register_output_dir(
     rel_dir: str,
     label: str | None = None,
     set_current: bool = False,
+    slug: str = "default",
 ) -> dict:
     """Append (or update) a single directive entry without resending the list.
 
@@ -329,7 +364,7 @@ def register_output_dir(
     ``label`` is supplied; otherwise the existing label is kept. When
     ``set_current`` is True, the new dir becomes the active one.
     """
-    base = project_path(name)
+    base = project_path(name, slug)
     if not base.exists():
         raise FileNotFoundError(name)
     rel = (rel_dir or "").strip("/")
@@ -338,12 +373,12 @@ def register_output_dir(
     # Reuse the same sanitizer for the single entry — catches path escapes,
     # empty leaf segments, etc., consistent with full-PUT behavior.
     entry = {"dir": rel, "label": (label or "").strip() or _default_label(rel)}
-    cleaned = _sanitize_dirs(name, base, [entry])
+    cleaned = _sanitize_dirs(name, base, [entry], slug)
     if not cleaned:
         raise ValueError(f"invalid output dir: {rel_dir!r}")
     new_entry = cleaned[0]
 
-    current = read_output_dirs(name)
+    current = read_output_dirs(name, slug)
     dirs = list(current["dirs"])
     found = False
     for i, d in enumerate(dirs):
@@ -356,17 +391,17 @@ def register_output_dir(
     if not found:
         dirs.append(new_entry)
     active = new_entry["dir"] if set_current else current["current"]
-    return write_output_dirs(name, {"current": active, "dirs": dirs})
+    return write_output_dirs(name, {"current": active, "dirs": dirs}, slug)
 
 
-def list_recent(name: str, limit: int = 20) -> list[dict]:
+def list_recent(name: str, limit: int = 20, slug: str = "default") -> list[dict]:
     """Recent artifact files in a project, newest first.
 
     Excludes input materials (sources/), tooling noise (.git, node_modules, …),
     hidden files, and the rendered slide deck under svg_output/ (those are
     aggregated as a single 'Slide deck' workbench entry on the frontend).
     """
-    base = project_path(name)
+    base = project_path(name, slug)
     if not base.exists():
         return []
     items: list[dict] = []
@@ -394,9 +429,9 @@ def list_recent(name: str, limit: int = 20) -> list[dict]:
     return items[:limit]
 
 
-def deck_summary(name: str) -> dict | None:
+def deck_summary(name: str, slug: str = "default") -> dict | None:
     """Aggregate metadata for the rendered slide deck, or None if empty."""
-    slides = list_slides(name)
+    slides = list_slides(name, slug)
     if not slides:
         return None
     return {
@@ -405,8 +440,8 @@ def deck_summary(name: str) -> dict | None:
     }
 
 
-def list_exports(name: str) -> list[dict]:
-    p = project_path(name) / "exports"
+def list_exports(name: str, slug: str = "default") -> list[dict]:
+    p = project_path(name, slug) / "exports"
     if not p.exists():
         return []
     return [
@@ -415,9 +450,11 @@ def list_exports(name: str) -> list[dict]:
     ]
 
 
-def init_project(name: str, fmt: str = "ppt169") -> Path:
-    # --dir points project_manager at the default-tenant projects root so new
+def init_project(name: str, fmt: str = "ppt169", slug: str = "default") -> Path:
+    # --dir points project_manager at the tenant projects root so new
     # decks land alongside the migrated ones rather than at REPO_ROOT/projects/.
+    projects_dir = tenant_projects_dir(slug)
+    projects_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         _python_bin(),
         str(SCRIPTS_DIR / "project_manager.py"),
@@ -426,7 +463,7 @@ def init_project(name: str, fmt: str = "ppt169") -> Path:
         "--format",
         fmt,
         "--dir",
-        str(PROJECTS_DIR),
+        str(projects_dir),
     ]
     proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -437,7 +474,7 @@ def init_project(name: str, fmt: str = "ppt169") -> Path:
             p = Path(line)
             if p.exists():
                 return p
-    candidates = sorted(PROJECTS_DIR.glob(f"{name}_{fmt}_*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    candidates = sorted(projects_dir.glob(f"{name}_{fmt}_*"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
         raise RuntimeError(f"project_manager.py init produced no project dir.\nstdout: {proc.stdout}")
     return candidates[0]

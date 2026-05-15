@@ -19,8 +19,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent import registry
-from authz import current_user
+from authz import current_user, require_platform_admin, require_tenant_role
 import tenants
+import users
 from users import User
 from files import (
     PROJECTS_DIR,
@@ -132,6 +133,27 @@ class CreateFromTemplateBody(BaseModel):
     format: str | None = None
 
 
+class CreateTenantBody(BaseModel):
+    slug: str
+    name: str
+    default_format: str = "ppt169"
+    owner_user_id: str | None = None  # platform-admin only field; defaults to caller
+
+
+class UpdateTenantBody(BaseModel):
+    name: str | None = None
+    default_format: str | None = None
+
+
+class AddMemberBody(BaseModel):
+    user: str  # id or email
+    role: str  # viewer | editor | owner
+
+
+class UpdateMemberBody(BaseModel):
+    role: str
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True, "repo_root": str(REPO_ROOT)}
@@ -183,8 +205,256 @@ def tenant_detail(slug: str, user: User = Depends(current_user)):
     }
 
 
+# ─── Tenant CRUD (platform-admin only for create/delete) ────────────────────
+
+@app.post("/api/tenants")
+def tenants_create(body: CreateTenantBody, user: User = Depends(require_platform_admin)):
+    """Create a new tenant. Platform-admin only.
+
+    The owner defaults to the caller; pass ``owner_user_id`` to assign someone
+    else (the user record must already exist).
+    """
+    owner = (body.owner_user_id or user.id).strip()
+    try:
+        cfg = tenants.create_tenant(body.slug, body.name, owner, body.default_format)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return cfg
+
+
+@app.patch("/api/tenants/{slug}")
+def tenants_update(slug: str, body: UpdateTenantBody, _: User = Depends(require_tenant_role("owner"))):
+    """Edit a tenant's name / default_format. Tenant owners (or platform admins)."""
+    try:
+        return tenants.update_tenant_config(
+            slug, name=body.name, default_format=body.default_format
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="tenant not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/tenants/{slug}")
+def tenants_delete(slug: str, _: User = Depends(require_platform_admin)):
+    """Destroy a tenant — projects, templates, shared assets, memberships."""
+    try:
+        tenants.delete_tenant(slug)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="tenant not found")
+    return {"deleted": slug}
+
+
+# ─── Member CRUD (owner-level on the tenant) ────────────────────────────────
+
+@app.get("/api/tenants/{slug}/members")
+def members_list(slug: str, _: User = Depends(require_tenant_role("viewer"))):
+    """Any member can see the roster."""
+    return {"members": tenants.read_members(slug)}
+
+
+@app.post("/api/tenants/{slug}/members")
+def members_add(slug: str, body: AddMemberBody, _: User = Depends(require_tenant_role("owner"))):
+    try:
+        return tenants.add_member(slug, body.user, body.role)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.patch("/api/tenants/{slug}/members/{user_id}")
+def members_update(slug: str, user_id: str, body: UpdateMemberBody, _: User = Depends(require_tenant_role("owner"))):
+    try:
+        return tenants.update_member_role(slug, user_id, body.role)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/tenants/{slug}/members/{user_id}")
+def members_remove(slug: str, user_id: str, _: User = Depends(require_tenant_role("owner"))):
+    try:
+        tenants.remove_member(slug, user_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"removed": user_id}
+
+
+# ─── Tenant-prefixed project routes ─────────────────────────────────────────
+# These mirror /api/projects/{name}/* but enforce tenant membership and
+# resolve paths under tenants/<slug>/projects/. The legacy /api/projects/*
+# routes still work and resolve under tenants/default/ for backwards
+# compatibility — they are deprecated and will redirect in a later phase.
+
+@app.get("/api/tenants/{slug}/projects")
+def tenant_projects_list(slug: str, _: User = Depends(require_tenant_role("viewer"))):
+    from files import tenant_projects_dir
+    base = tenant_projects_dir(slug)
+    if not base.exists():
+        return {"tenant": slug, "projects": []}
+    items = []
+    for p in sorted(base.iterdir()):
+        if not p.is_dir():
+            continue
+        items.append({
+            "name": p.name,
+            "slides": len(list_slides(p.name, slug)),
+            "exports": len(list_exports(p.name, slug)),
+            "mtime": int(p.stat().st_mtime),
+        })
+    return {"tenant": slug, "projects": items}
+
+
+@app.get("/api/tenants/{slug}/projects/{name}/slides")
+def tenant_slides(slug: str, name: str, dir: str | None = None, _: User = Depends(require_tenant_role("viewer"))):
+    if dir:
+        return {"project": name, "slides": list_dir_slides(name, dir, slug)}
+    return {"project": name, "slides": list_slides(name, slug)}
+
+
+@app.get("/api/tenants/{slug}/projects/{name}/exports")
+def tenant_exports(slug: str, name: str, _: User = Depends(require_tenant_role("viewer"))):
+    return {"project": name, "exports": list_exports(name, slug)}
+
+
+@app.get("/api/tenants/{slug}/projects/{name}/recent")
+def tenant_recent(slug: str, name: str, limit: int = 20, _: User = Depends(require_tenant_role("viewer"))):
+    if not project_path(name, slug).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    if limit < 1:
+        limit = 1
+    if limit > 100:
+        limit = 100
+    return {
+        "project": name,
+        "deck": deck_summary(name, slug),
+        "recent": list_recent(name, limit=limit, slug=slug),
+    }
+
+
+@app.get("/api/tenants/{slug}/projects/{name}/tree")
+def tenant_project_tree(slug: str, name: str, path: str = "", _: User = Depends(require_tenant_role("viewer"))):
+    if not project_path(name, slug).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return list_tree(name, path, slug)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid path")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not found")
+
+
+@app.get("/api/tenants/{slug}/projects/{name}/file")
+def tenant_project_file(slug: str, name: str, path: str, _: User = Depends(require_tenant_role("viewer"))):
+    if not project_path(name, slug).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        target = safe_rel(name, path, slug)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    if target.suffix.lower() == ".svg":
+        try:
+            body = inline_icons(target.read_text(encoding="utf-8"))
+        except Exception:
+            return FileResponse(target, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+        return Response(content=body, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+    return FileResponse(target, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/tenants/{slug}/projects/{name}/output-dirs")
+def tenant_output_dirs(slug: str, name: str, _: User = Depends(require_tenant_role("viewer"))):
+    if not project_path(name, slug).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        directive = read_output_dirs(name, slug)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="project not found")
+    enriched = []
+    for entry in directive["dirs"]:
+        slides = list_dir_slides(name, entry["dir"], slug)
+        enriched.append({
+            **entry,
+            "slides": slides,
+            "count": len(slides),
+            "mtime": max((s["mtime"] for s in slides), default=0),
+        })
+    return {"current": directive["current"], "dirs": enriched}
+
+
+@app.put("/api/tenants/{slug}/projects/{name}/output-dirs")
+def tenant_put_output_dirs(slug: str, name: str, body: OutputDirsBody, _: User = Depends(require_tenant_role("editor"))):
+    if not project_path(name, slug).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return write_output_dirs(name, body.model_dump(), slug)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/tenants/{slug}/projects/{name}/output-dirs/register")
+def tenant_register_dir(slug: str, name: str, body: OutputDirsRegisterBody, _: User = Depends(require_tenant_role("editor"))):
+    if not project_path(name, slug).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return register_output_dir(name, body.dir, body.label, body.set_current, slug)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="project not found")
+
+
+# ─── Tenant-prefixed template routes ────────────────────────────────────────
+
+@app.get("/api/tenants/{slug}/templates")
+def tenant_templates_list(slug: str, _: User = Depends(require_tenant_role("viewer"))):
+    return {"templates": list_templates(slug)}
+
+
+@app.get("/api/tenants/{slug}/templates/{name}")
+def tenant_templates_detail(slug: str, name: str, _: User = Depends(require_tenant_role("viewer"))):
+    try:
+        return read_template(name, slug)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="template not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/tenants/{slug}/templates")
+def tenant_templates_create(slug: str, body: SaveTemplateBody, _: User = Depends(require_tenant_role("editor"))):
+    try:
+        return save_project_as_template(
+            body.source_project, body.name, body.description or "", body.include_images, slug
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="source project not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/tenants/{slug}/templates/{name}")
+def tenant_templates_delete(slug: str, name: str, _: User = Depends(require_tenant_role("editor"))):
+    try:
+        delete_template(name, slug)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="template not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"deleted": name}
+
+
 @app.get("/api/projects")
-def projects_list():
+def projects_list(_: User = Depends(current_user)):
+    """Legacy: lists projects under tenants/default/. Use the tenant-prefixed
+    route ``/api/tenants/{slug}/projects`` for non-default tenants."""
     if not PROJECTS_DIR.exists():
         return {"projects": []}
     items = []
@@ -218,13 +488,65 @@ def _norm_tier(t: str) -> str:
     return t if t in _TIER_TO_MODEL else "auto"
 
 
+def _ensure_default_viewer(user: User) -> None:
+    """Legacy-route read check for the ``default`` tenant.
+
+    Any membership on ``default`` is sufficient; platform admins bypass.
+    Used by legacy ``/api/projects/...`` and ``/api/templates/...`` reads
+    that don't have ``{slug}`` in the path and can't use ``require_tenant_role``.
+    """
+    if user.platform_admin:
+        return
+    for m in user.memberships:
+        if m.tenant_slug == "default":
+            return
+    raise HTTPException(status_code=403, detail="not a member of tenant 'default'")
+
+
+def _ensure_default_editor(user: User) -> None:
+    """Legacy-route write check for the ``default`` tenant.
+
+    Same shape as :func:`_ensure_default_viewer` but requires editor+ role.
+    """
+    if user.platform_admin:
+        return
+    for m in user.memberships:
+        if m.tenant_slug == "default" and m.role in {"editor", "owner"}:
+            return
+    raise HTTPException(status_code=403, detail="requires editor on tenant 'default'")
+
+
+def _resolve_session_for_user(sid: str, user: User):
+    """Fetch a session and verify the caller created it (or is platform admin).
+
+    Sessions carry ``user_id`` so cross-user access is denied even within the
+    same tenant — the chat surface is single-user. 404 (not 403) when the
+    session doesn't exist *or* belongs to someone else; we don't want a
+    probing caller to learn that a sid is real but theirs to read.
+    """
+    session = registry.get(sid)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    if user.platform_admin:
+        return session
+    if session.user_id and session.user_id != user.id:
+        raise HTTPException(status_code=404, detail="session not found")
+    return session
+
+
 @app.post("/api/sessions")
-async def create_session(body: CreateSessionBody):
+async def create_session(
+    body: CreateSessionBody,
+    user: User = Depends(current_user),
+):
+    """Legacy: defaults to the ``default`` tenant. Tenant-prefixed callers
+    should use ``POST /api/tenants/{slug}/sessions`` instead."""
+    _ensure_default_editor(user)
     try:
-        proj = init_project(body.name, body.format)
+        proj = init_project(body.name, body.format, slug="default")
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
-    session = await registry.create(proj)
+    session = await registry.create(proj, tenant_slug="default", user_id=user.id)
     session.permission_mode = _norm_mode(body.permission_mode)
     tier = _norm_tier(body.model_tier)
     session.model = _TIER_TO_MODEL[tier]
@@ -232,62 +554,113 @@ async def create_session(body: CreateSessionBody):
         "session_id": session.id,
         "project": proj.name,
         "project_path": str(proj.relative_to(REPO_ROOT)),
+        "tenant_slug": "default",
         "permission_mode": session.permission_mode,
         "model_tier": tier,
     }
 
 
 @app.post("/api/sessions/attach")
-async def attach_session(body: AttachSessionBody):
-    """Attach a session to an existing project (no init)."""
-    proj = project_path(body.name)
+async def attach_session(
+    body: AttachSessionBody,
+    user: User = Depends(current_user),
+):
+    """Attach a session to an existing project (no init). Legacy default-tenant alias."""
+    _ensure_default_editor(user)
+    proj = project_path(body.name, slug="default")
     if not proj.exists():
         raise HTTPException(status_code=404, detail=f"project not found: {body.name}")
-    session = await registry.create(proj)
+    session = await registry.create(proj, tenant_slug="default", user_id=user.id)
     session.permission_mode = _norm_mode(body.permission_mode)
     tier = _norm_tier(body.model_tier)
     session.model = _TIER_TO_MODEL[tier]
     return {
         "session_id": session.id,
         "project": proj.name,
+        "tenant_slug": "default",
+        "permission_mode": session.permission_mode,
+        "model_tier": tier,
+    }
+
+
+@app.post("/api/tenants/{slug}/sessions")
+async def create_tenant_session(
+    slug: str,
+    body: CreateSessionBody,
+    user: User = Depends(require_tenant_role("editor")),
+):
+    """Create a session bound to a specific tenant. Caller must be at
+    least editor on the tenant — viewers cannot run agent chats."""
+    try:
+        proj = init_project(body.name, body.format, slug=slug)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    session = await registry.create(proj, tenant_slug=slug, user_id=user.id)
+    session.permission_mode = _norm_mode(body.permission_mode)
+    tier = _norm_tier(body.model_tier)
+    session.model = _TIER_TO_MODEL[tier]
+    return {
+        "session_id": session.id,
+        "project": proj.name,
+        "project_path": str(proj.relative_to(REPO_ROOT)),
+        "tenant_slug": slug,
+        "permission_mode": session.permission_mode,
+        "model_tier": tier,
+    }
+
+
+@app.post("/api/tenants/{slug}/sessions/attach")
+async def attach_tenant_session(
+    slug: str,
+    body: AttachSessionBody,
+    user: User = Depends(require_tenant_role("editor")),
+):
+    """Attach a session to an existing project under a specific tenant."""
+    proj = project_path(body.name, slug=slug)
+    if not proj.exists():
+        raise HTTPException(status_code=404, detail=f"project not found: {body.name}")
+    session = await registry.create(proj, tenant_slug=slug, user_id=user.id)
+    session.permission_mode = _norm_mode(body.permission_mode)
+    tier = _norm_tier(body.model_tier)
+    session.model = _TIER_TO_MODEL[tier]
+    return {
+        "session_id": session.id,
+        "project": proj.name,
+        "tenant_slug": slug,
         "permission_mode": session.permission_mode,
         "model_tier": tier,
     }
 
 
 @app.post("/api/sessions/{sid}/permission_mode")
-def set_mode(sid: str, body: PermissionModeBody):
-    session = registry.get(sid)
-    if not session:
-        raise HTTPException(status_code=404, detail="session not found")
+def set_mode(sid: str, body: PermissionModeBody, user: User = Depends(current_user)):
+    session = _resolve_session_for_user(sid, user)
     session.permission_mode = _norm_mode(body.mode)
     return {"permission_mode": session.permission_mode}
 
 
 @app.post("/api/sessions/{sid}/model_tier")
-async def set_model_tier(sid: str, body: ModelTierBody):
-    session = registry.get(sid)
-    if not session:
-        raise HTTPException(status_code=404, detail="session not found")
+async def set_model_tier(
+    sid: str, body: ModelTierBody, user: User = Depends(current_user)
+):
+    session = _resolve_session_for_user(sid, user)
     tier = _norm_tier(body.tier)
     await session.set_model(_TIER_TO_MODEL[tier])
     return {"model_tier": tier}
 
 
 @app.post("/api/sessions/{sid}/interrupt")
-async def interrupt_session(sid: str):
-    session = registry.get(sid)
-    if not session:
-        raise HTTPException(status_code=404, detail="session not found")
+async def interrupt_session(sid: str, user: User = Depends(current_user)):
+    session = _resolve_session_for_user(sid, user)
     delivered = await session.interrupt()
     return {"ok": True, "delivered": delivered}
 
 
 @app.post("/api/sessions/{sid}/permission")
-def resolve_permission(sid: str, body: PermissionDecisionBody):
-    session = registry.get(sid)
-    if not session:
-        raise HTTPException(status_code=404, detail="session not found")
+def resolve_permission(
+    sid: str, body: PermissionDecisionBody, user: User = Depends(current_user)
+):
+    session = _resolve_session_for_user(sid, user)
     decision = "approve" if body.decision == "approve" else "deny"
     ok = session.resolve_permission(body.request_id, decision)
     if not ok:
@@ -296,16 +669,16 @@ def resolve_permission(sid: str, body: PermissionDecisionBody):
 
 
 @app.delete("/api/sessions/{sid}")
-async def delete_session(sid: str):
+async def delete_session(sid: str, user: User = Depends(current_user)):
+    # Look up before removing so we can enforce ownership.
+    _resolve_session_for_user(sid, user)
     await registry.remove(sid)
     return {"ok": True}
 
 
 @app.post("/api/sessions/{sid}/message")
-async def send_message(sid: str, body: ChatBody):
-    session = registry.get(sid)
-    if not session:
-        raise HTTPException(status_code=404, detail="session not found")
+async def send_message(sid: str, body: ChatBody, user: User = Depends(current_user)):
+    session = _resolve_session_for_user(sid, user)
 
     async def event_stream() -> AsyncIterator[bytes]:
         try:
@@ -341,10 +714,12 @@ async def _save_upload_to_project(session, file: UploadFile, relpath: Optional[s
 
 
 @app.post("/api/sessions/{sid}/import/file")
-async def import_file(sid: str, file: UploadFile = File(...)):
-    session = registry.get(sid)
-    if not session:
-        raise HTTPException(status_code=404, detail="session not found")
+async def import_file(
+    sid: str,
+    file: UploadFile = File(...),
+    user: User = Depends(current_user),
+):
+    session = _resolve_session_for_user(sid, user)
     try:
         return await _save_upload_to_project(session, file)
     except RuntimeError as e:
@@ -356,11 +731,10 @@ async def import_files(
     sid: str,
     files: list[UploadFile] = File(...),
     paths: Optional[list[str]] = Form(None),
+    user: User = Depends(current_user),
 ):
     """Multi-file upload from chat (supports drag-drop of folders + images)."""
-    session = registry.get(sid)
-    if not session:
-        raise HTTPException(status_code=404, detail="session not found")
+    session = _resolve_session_for_user(sid, user)
 
     results: list[dict] = []
     errors: list[dict] = []
@@ -374,10 +748,10 @@ async def import_files(
 
 
 @app.post("/api/sessions/{sid}/import/url")
-async def import_url_route(sid: str, body: UrlImportBody):
-    session = registry.get(sid)
-    if not session:
-        raise HTTPException(status_code=404, detail="session not found")
+async def import_url_route(
+    sid: str, body: UrlImportBody, user: User = Depends(current_user)
+):
+    session = _resolve_session_for_user(sid, user)
     try:
         result = import_url(session.project_path, body.url)
     except RuntimeError as e:
@@ -386,30 +760,33 @@ async def import_url_route(sid: str, body: UrlImportBody):
 
 
 @app.get("/api/projects/{name}/slides")
-def slides(name: str, dir: str | None = None):
+def slides(name: str, dir: str | None = None, user: User = Depends(current_user)):
     """List SVG slides. Defaults to `svg_output/` for back-compat.
 
     When `dir` is supplied, lists `*.svg` under that project-relative folder
     instead — used by Workbench to render decks in registered working dirs
     other than `svg_output/` (svg_final, flashcards/templates, …).
     """
+    _ensure_default_viewer(user)
     if dir:
         return {"project": name, "slides": list_dir_slides(name, dir)}
     return {"project": name, "slides": list_slides(name)}
 
 
 @app.get("/api/projects/{name}/exports")
-def exports(name: str):
+def exports(name: str, user: User = Depends(current_user)):
+    _ensure_default_viewer(user)
     return {"project": name, "exports": list_exports(name)}
 
 
 @app.get("/api/projects/{name}/recent")
-def recent(name: str, limit: int = 20):
+def recent(name: str, limit: int = 20, user: User = Depends(current_user)):
     """Workbench feed: recent artifacts in this project, newest first.
 
     Returns a separate `deck` summary so the UI can offer the rendered slide
     deck as a single virtual entry instead of N individual SVGs.
     """
+    _ensure_default_viewer(user)
     if not project_path(name).exists():
         raise HTTPException(status_code=404, detail="project not found")
     if limit < 1:
@@ -424,7 +801,8 @@ def recent(name: str, limit: int = 20):
 
 
 @app.get("/api/projects/{name}/tree")
-def project_tree(name: str, path: str = ""):
+def project_tree(name: str, path: str = "", user: User = Depends(current_user)):
+    _ensure_default_viewer(user)
     if not project_path(name).exists():
         raise HTTPException(status_code=404, detail="project not found")
     try:
@@ -436,7 +814,8 @@ def project_tree(name: str, path: str = ""):
 
 
 @app.get("/api/projects/{name}/file")
-def project_file(name: str, path: str):
+def project_file(name: str, path: str, user: User = Depends(current_user)):
+    _ensure_default_viewer(user)
     if not project_path(name).exists():
         raise HTTPException(status_code=404, detail="project not found")
     try:
@@ -458,7 +837,7 @@ def project_file(name: str, path: str):
 
 
 @app.get("/api/projects/{name}/web/{path:path}")
-def project_web(name: str, path: str):
+def project_web(name: str, path: str, user: User = Depends(current_user)):
     """Path-style file server for web previews.
 
     The query-string-based /file endpoint can't host HTML composites: a
@@ -468,6 +847,7 @@ def project_web(name: str, path: str):
     the project, so HTML artifacts with sibling assets render in the
     workbench iframe.
     """
+    _ensure_default_viewer(user)
     if not project_path(name).exists():
         raise HTTPException(status_code=404, detail="project not found")
     try:
@@ -497,7 +877,8 @@ _IMAGE_MEDIA = {
 
 
 @app.get("/api/projects/{name}/svg/{filename}")
-def serve_svg(name: str, filename: str):
+def serve_svg(name: str, filename: str, user: User = Depends(current_user)):
+    _ensure_default_viewer(user)
     if not filename.endswith(".svg") or "/" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="invalid filename")
     path = project_path(name) / "svg_output" / filename
@@ -519,13 +900,14 @@ def serve_svg(name: str, filename: str):
 
 
 @app.get("/api/projects/{name}/output-dirs")
-def output_dirs(name: str):
+def output_dirs(name: str, user: User = Depends(current_user)):
     """Return the project's output_dirs directive, enriched with slide listings.
 
     The directive is the single source of truth for Workbench: it lists every
     deck the agent has produced (svg_output/, svg_final/, flashcards/…), each
     with a friendly label the UI displays in place of the raw path.
     """
+    _ensure_default_viewer(user)
     if not project_path(name).exists():
         raise HTTPException(status_code=404, detail="project not found")
     try:
@@ -545,8 +927,9 @@ def output_dirs(name: str):
 
 
 @app.put("/api/projects/{name}/output-dirs")
-def put_output_dirs(name: str, body: OutputDirsBody):
+def put_output_dirs(name: str, body: OutputDirsBody, user: User = Depends(current_user)):
     """Replace the directive (used by the agent to register a new working dir)."""
+    _ensure_default_editor(user)
     if not project_path(name).exists():
         raise HTTPException(status_code=404, detail="project not found")
     try:
@@ -556,8 +939,11 @@ def put_output_dirs(name: str, body: OutputDirsBody):
 
 
 @app.post("/api/projects/{name}/output-dirs/current")
-def set_output_dirs_current(name: str, body: OutputDirsCurrentBody):
+def set_output_dirs_current(
+    name: str, body: OutputDirsCurrentBody, user: User = Depends(current_user)
+):
     """Flip the active working dir (used when the user picks one in Workbench)."""
+    _ensure_default_editor(user)
     if not project_path(name).exists():
         raise HTTPException(status_code=404, detail="project not found")
     directive = read_output_dirs(name)
@@ -569,12 +955,15 @@ def set_output_dirs_current(name: str, body: OutputDirsCurrentBody):
 
 
 @app.post("/api/projects/{name}/output-dirs/register")
-def register_dir(name: str, body: OutputDirsRegisterBody):
+def register_dir(
+    name: str, body: OutputDirsRegisterBody, user: User = Depends(current_user)
+):
     """Append (or update) a single deck entry without resending the full list.
 
     This is the safe path for the agent: it preserves every existing dir, so
     a forgetful caller can never accidentally unregister other decks.
     """
+    _ensure_default_editor(user)
     if not project_path(name).exists():
         raise HTTPException(status_code=404, detail="project not found")
     try:
@@ -586,9 +975,12 @@ def register_dir(name: str, body: OutputDirsRegisterBody):
 
 
 @app.post("/api/projects/{name}/svg/{filename}")
-def save_svg(name: str, filename: str, body: SvgSaveBody):
+def save_svg(
+    name: str, filename: str, body: SvgSaveBody, user: User = Depends(current_user)
+):
     """Overwrite an existing SVG in svg_output/. Refuses if the target file
     is missing or the path tries to escape the folder."""
+    _ensure_default_editor(user)
     if not filename.endswith(".svg") or "/" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="invalid filename")
     folder = project_path(name) / "svg_output"
@@ -617,13 +1009,16 @@ def save_svg(name: str, filename: str, body: SvgSaveBody):
 
 
 @app.post("/api/projects/{name}/svg-save")
-def save_svg_path(name: str, path: str, body: SvgSaveBody):
+def save_svg_path(
+    name: str, path: str, body: SvgSaveBody, user: User = Depends(current_user)
+):
     """Path-based save: overwrites any existing `.svg` inside the project.
 
     The legacy `/svg/{filename}` endpoint is hardcoded to svg_output/. This
     one accepts any registered working dir (svg_final, flashcards/templates, …)
     so the SlideEditor stays useful when the user switches decks.
     """
+    _ensure_default_editor(user)
     if not project_path(name).exists():
         raise HTTPException(status_code=404, detail="project not found")
     try:
@@ -647,9 +1042,10 @@ def save_svg_path(name: str, path: str, body: SvgSaveBody):
 
 
 @app.get("/api/projects/{name}/images/{filename}")
-def serve_project_image(name: str, filename: str):
+def serve_project_image(name: str, filename: str, user: User = Depends(current_user)):
     """Serve files from <project>/images/. Required so SVGs in svg_output/
     can reference ../images/foo.png via relative URL when rendered in browser."""
+    _ensure_default_viewer(user)
     if "/" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="invalid filename")
     path = project_path(name) / "images" / filename
@@ -660,7 +1056,8 @@ def serve_project_image(name: str, filename: str):
 
 
 @app.get("/api/projects/{name}/export.pptx")
-def serve_latest_pptx(name: str):
+def serve_latest_pptx(name: str, user: User = Depends(current_user)):
+    _ensure_default_viewer(user)
     items = list_exports(name)
     if not items:
         raise HTTPException(status_code=404, detail="no exports")
@@ -678,12 +1075,14 @@ def serve_latest_pptx(name: str):
 # → agent picks brand image files from SKILL.md context → POST /api/templates.
 
 @app.get("/api/templates")
-def templates_list():
+def templates_list(user: User = Depends(current_user)):
+    _ensure_default_viewer(user)
     return {"templates": list_templates()}
 
 
 @app.get("/api/templates/{name}")
-def templates_detail(name: str):
+def templates_detail(name: str, user: User = Depends(current_user)):
+    _ensure_default_viewer(user)
     try:
         return read_template(name)
     except FileNotFoundError:
@@ -693,8 +1092,9 @@ def templates_detail(name: str):
 
 
 @app.get("/api/templates/{name}/file")
-def templates_file(name: str, path: str = ""):
+def templates_file(name: str, path: str = "", user: User = Depends(current_user)):
     """Serve a file from a template directory (thumbnail, SKILL.md, etc.)."""
+    _ensure_default_viewer(user)
     try:
         target = template_file_path(name, path)
     except FileNotFoundError:
@@ -717,7 +1117,8 @@ def templates_file(name: str, path: str = ""):
 
 
 @app.post("/api/templates")
-def templates_create(body: SaveTemplateBody):
+def templates_create(body: SaveTemplateBody, user: User = Depends(current_user)):
+    _ensure_default_editor(user)
     try:
         return save_project_as_template(
             body.source_project,
@@ -732,7 +1133,8 @@ def templates_create(body: SaveTemplateBody):
 
 
 @app.delete("/api/templates/{name}")
-def templates_delete(name: str):
+def templates_delete(name: str, user: User = Depends(current_user)):
+    _ensure_default_editor(user)
     try:
         delete_template(name)
     except FileNotFoundError:
@@ -743,7 +1145,10 @@ def templates_delete(name: str):
 
 
 @app.post("/api/projects/from-template")
-def projects_from_template(body: CreateFromTemplateBody):
+def projects_from_template(
+    body: CreateFromTemplateBody, user: User = Depends(current_user)
+):
+    _ensure_default_editor(user)
     try:
         project_dir = create_project_from_template(
             body.template,
@@ -763,7 +1168,8 @@ def projects_from_template(body: CreateFromTemplateBody):
 
 
 @app.get("/api/projects/{name}/events")
-async def project_events(name: str):
+async def project_events(name: str, user: User = Depends(current_user)):
+    _ensure_default_viewer(user)
     proj = project_path(name)
     if not proj.exists():
         raise HTTPException(status_code=404, detail="project not found")

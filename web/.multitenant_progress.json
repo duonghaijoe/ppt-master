@@ -1,10 +1,31 @@
 {
-  "current_phase": 1,
-  "completed": [],
+  "current_phase": 3,
+  "completed": [1, 2],
   "blockers": [],
-  "last_commit": null,
+  "last_commit": "4d84d890",
   "started_at": "2026-05-15T00:00:00Z",
   "notes": {
-    "1": "Phase 1 in progress. Canary mode: loop will stop after PR opens for human review."
+    "1": "PR #1 squash-merged to main as 2e066254. 8/8 phase-1 tests passed; path-mapper + tenants/default/ live.",
+    "2": "PR #2 squash-merged as 4d84d890. 12/12 phase-2 tests + 8/8 phase-1 regression = 20/20 green. /api/me + /api/tenants + /api/tenants/{slug} live; dev shim DEV_USER_ID/DEV_USER_EMAIL working.",
+    "3": "Phase 3 starting: role enforcement on every route, tenant-prefix routes, legacy redirects to default."
+  },
+  "phase_1": {
+    "branch": "feature/multitenant-phase-1",
+    "pr_url": "https://github.com/duonghaijoe/ppt-master/pull/1",
+    "merged_commit": "2e066254",
+    "tests_status": "8/8 pass"
+  },
+  "phase_2": {
+    "branch": "feature/multitenant-phase-2",
+    "pr_url": "https://github.com/duonghaijoe/ppt-master/pull/2",
+    "merged_commit": "4d84d890",
+    "tests_status": "12/12 pass (20/20 cumulative)",
+    "verify_results": {
+      "header_identity_and_dev_shim": "PASS",
+      "api_me_memberships_and_admin_flag": "PASS",
+      "api_tenants_membership_filter": "PASS",
+      "dashboard_fetches_me_no_role_enforcement": "PASS (API only — frontend deferred per spec)",
+      "reverse_proxy_injection": "CODE-ONLY (no proxy in dev env)"
+    }
   }
 }
