@@ -150,8 +150,8 @@ make the API call. The snapshot is only as good as the source.
 
 ### Hard rules
 
-- Direct Write/Edit to `<repo>/templates/<name>/` is denied. The API is the
-  only path.
+- Direct Write/Edit to `<repo>/tenants/default/templates/<name>/` is denied.
+  The API is the only path.
 - Do NOT create files under `skills/ppt-master/templates/`, even via Bash.
   That tree is the skill package's own layout library, not a place for
   user templates.
@@ -201,10 +201,12 @@ _SKILL_TEMPLATES_WRITE_PATTERNS = [
     re.compile(rf"\b(?:cp|mv|rsync)\s+\S+\s+(?:-\S+\s+)*{_SKILL_TPL}", re.I),
     re.compile(rf">>?\s*{_SKILL_TPL}"),
 ]
-# Repo-root templates/ — `\s+` in each verb pattern already anchors the path
+# Tenant templates/ — `\s+` in each verb pattern already anchors the path
 # directly after the verb's arguments, so `cp src foo/templates/bar` (which
-# writes to a project's own `templates/` dir, not the repo root) won't match.
-_REPO_TPL = r"(?:\./)?templates/[A-Za-z0-9_.-]+"
+# writes to a project's own `templates/` dir, not the tenant root) won't match.
+# Matches both legacy repo-root paths and the post-Phase-1 tenants/<slug>/
+# layout so the deny still triggers for stragglers during the transition.
+_REPO_TPL = r"(?:\./)?(?:tenants/[A-Za-z0-9_-]+/)?templates/[A-Za-z0-9_.-]+"
 _REPO_TEMPLATES_WRITE_PATTERNS = [
     re.compile(rf"\bmkdir(?:\s+-\S+)*\s+{_REPO_TPL}", re.I),
     re.compile(rf"\btee\s+(?:-\S+\s+)*{_REPO_TPL}", re.I),
@@ -337,10 +339,10 @@ class Session:
                 target.relative_to(proj)
             except ValueError:
                 # Writes are project-scoped — with one structural exception:
-                # the repo-root `templates/` tree (user-saved templates) is
+                # the tenant `templates/` tree (user-saved templates) is
                 # written to via the API, never directly. Any other path
                 # outside the project root is denied.
-                templates_root = (REPO_ROOT / "templates").resolve()
+                templates_root = (REPO_ROOT / "tenants" / "default" / "templates").resolve()
                 try:
                     target.relative_to(templates_root)
                     return (

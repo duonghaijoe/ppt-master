@@ -28,10 +28,13 @@ import shutil
 import time
 from pathlib import Path
 
-from files import PROJECTS_DIR, REPO_ROOT, project_path, safe_rel
+from files import DEFAULT_TENANT_ROOT, PROJECTS_DIR, REPO_ROOT, project_path, safe_rel
 
 
-TEMPLATES_DIR = REPO_ROOT / "templates"
+# Templates live under the default tenant root in the post-Phase-1 layout. The
+# directory is created lazily by save_project_as_template; if it doesn't exist
+# yet (clean repos), reads just return [] as before.
+TEMPLATES_DIR = DEFAULT_TENANT_ROOT / "templates"
 
 # What we copy verbatim if it exists in the source project. The keys are
 # project-relative paths; bool indicates whether the entry is a directory.
