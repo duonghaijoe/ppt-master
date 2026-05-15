@@ -55,7 +55,10 @@ def test_no_stray_legacy_projects_dir() -> None:
     """
     legacy = REPO_ROOT / "projects"
     if legacy.exists():
-        entries = [p for p in legacy.iterdir() if p.name not in {".DS_Store"}]
+        # README.md is the redirect note pointing callers at the new location;
+        # leaving it in place is intentional, not migration drift.
+        allowed = {".DS_Store", "README.md"}
+        entries = [p for p in legacy.iterdir() if p.name not in allowed]
         assert not entries, f"legacy projects/ still has content: {entries}"
 
 
