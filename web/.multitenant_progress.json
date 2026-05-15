@@ -1,14 +1,15 @@
 {
-  "current_phase": 4,
-  "completed": [1, 2, 3],
+  "current_phase": 5,
+  "completed": [1, 2, 3, 4],
   "blockers": [],
-  "last_commit": "e02f260c",
+  "last_commit": "dc8061a7",
   "started_at": "2026-05-15T00:00:00Z",
   "notes": {
     "1": "PR #1 squash-merged to main as 2e066254. 8/8 phase-1 tests passed; path-mapper + tenants/default/ live.",
     "2": "PR #2 squash-merged as 4d84d890. 12/12 phase-2 tests + 8/8 phase-1 regression = 20/20 green. /api/me + /api/tenants + /api/tenants/{slug} live; dev shim DEV_USER_ID/DEV_USER_EMAIL working.",
     "3": "PR #3 squash-merged as e02f260c. 23/23 phase-3 tests + 20/20 regression = 43/43 green. Role enforcement on every route (tenant-prefixed + legacy), session ownership, agent cross-tenant sandbox via _TENANT_PATH_PATTERN, guardrail prompt updated.",
-    "4": "Phase 4 starting: platform scope. Move skills/ → platform/skills/ (read-only from sandbox), add /api/platform/* endpoints, surface platform read paths to agent."
+    "4": "PR #4 squash-merged as dc8061a7. 19/19 phase-4 tests + 43/43 regression = 62/62 green. skills/ → platform/skills/ via git mv (11,981 renames), /api/platform/skills (list/get/tree/file) + admin-only /api/platform/admins; agent sandbox denies .platform.json and platform/admins/secrets paths from Read and Bash.",
+    "5": "Phase 5 starting: metering capture + image-gen mediation. New providers/, metering.py, platform/billing.db, platform/pricing.json. Hook record_chat_usage into agent event loop. Move image gen behind /api/tenants/{t}/projects/{p}/images/generate."
   },
   "phase_1": {
     "branch": "feature/multitenant-phase-1",
@@ -27,6 +28,20 @@
       "api_tenants_membership_filter": "PASS",
       "dashboard_fetches_me_no_role_enforcement": "PASS (API only — frontend deferred per spec)",
       "reverse_proxy_injection": "CODE-ONLY (no proxy in dev env)"
+    }
+  },
+  "phase_4": {
+    "branch": "feature/multitenant-phase-4",
+    "pr_url": "https://github.com/duonghaijoe/ppt-master/pull/4",
+    "merged_commit": "dc8061a7",
+    "tests_status": "19/19 pass (62/62 cumulative)",
+    "verify_results": {
+      "skills_moved_to_platform_skills": "PASS",
+      "agent_prompt_updated": "PASS",
+      "root_claude_md_path_refs_updated": "PASS",
+      "api_platform_skills_endpoints_added": "PASS",
+      "tenant_agent_can_read_platform_skills": "PASS",
+      "tenants_cannot_list_platform_admins": "PASS"
     }
   },
   "phase_3": {
