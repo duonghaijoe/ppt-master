@@ -1,13 +1,14 @@
 {
-  "current_phase": 3,
-  "completed": [1, 2],
+  "current_phase": 4,
+  "completed": [1, 2, 3],
   "blockers": [],
-  "last_commit": "4d84d890",
+  "last_commit": "e02f260c",
   "started_at": "2026-05-15T00:00:00Z",
   "notes": {
     "1": "PR #1 squash-merged to main as 2e066254. 8/8 phase-1 tests passed; path-mapper + tenants/default/ live.",
     "2": "PR #2 squash-merged as 4d84d890. 12/12 phase-2 tests + 8/8 phase-1 regression = 20/20 green. /api/me + /api/tenants + /api/tenants/{slug} live; dev shim DEV_USER_ID/DEV_USER_EMAIL working.",
-    "3": "Phase 3 starting: role enforcement on every route, tenant-prefix routes, legacy redirects to default."
+    "3": "PR #3 squash-merged as e02f260c. 23/23 phase-3 tests + 20/20 regression = 43/43 green. Role enforcement on every route (tenant-prefixed + legacy), session ownership, agent cross-tenant sandbox via _TENANT_PATH_PATTERN, guardrail prompt updated.",
+    "4": "Phase 4 starting: platform scope. Move skills/ → platform/skills/ (read-only from sandbox), add /api/platform/* endpoints, surface platform read paths to agent."
   },
   "phase_1": {
     "branch": "feature/multitenant-phase-1",
@@ -26,6 +27,29 @@
       "api_tenants_membership_filter": "PASS",
       "dashboard_fetches_me_no_role_enforcement": "PASS (API only — frontend deferred per spec)",
       "reverse_proxy_injection": "CODE-ONLY (no proxy in dev env)"
+    }
+  },
+  "phase_3": {
+    "branch": "feature/multitenant-phase-3",
+    "pr_url": "https://github.com/duonghaijoe/ppt-master/pull/3",
+    "merged_commit": "e02f260c",
+    "tests_status": "23/23 pass (43/43 cumulative)",
+    "verify_results": {
+      "current_user_and_require_tenant_role_on_every_route": "PASS",
+      "tenant_prefixed_routes": "PASS",
+      "legacy_routes_gated_through_default_tenant": "PASS",
+      "viewer_cannot_write": "PASS",
+      "editor_cannot_manage_members": "PASS",
+      "owner_can_manage_members": "PASS",
+      "platform_admin_bypass": "PASS",
+      "session_ownership_enforcement": "PASS",
+      "sandbox_cross_tenant_read_deny": "PASS",
+      "sandbox_cross_tenant_write_deny": "PASS",
+      "sandbox_platform_skills_read_allow": "PASS",
+      "sandbox_bash_cross_tenant_pattern_deny": "PASS",
+      "sandbox_output_dirs_direct_write_deny": "PASS",
+      "sandbox_repo_template_write_deny": "PASS",
+      "sandbox_skill_py_edit_deny": "PASS"
     }
   }
 }
