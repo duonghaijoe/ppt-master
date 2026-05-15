@@ -12,13 +12,16 @@ import tempfile
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent import registry
+from authz import current_user
+import tenants
+from users import User
 from files import (
     PROJECTS_DIR,
     REPO_ROOT,
@@ -132,6 +135,52 @@ class CreateFromTemplateBody(BaseModel):
 @app.get("/api/health")
 def health():
     return {"ok": True, "repo_root": str(REPO_ROOT)}
+
+
+# ─── Identity & tenant directory ───────────────────────────────────────────
+# Phase 2 wiring: the proxy injects X-User-Id + X-User-Email, authz.current_user
+# resolves them to a stored User (creating on first sight) and stashes it on
+# request.state.user. Route-level enforcement (require_tenant_role, etc.) lands
+# in Phase 3 once the tenant-prefixed routes are in.
+
+@app.get("/api/me")
+def me(user: User = Depends(current_user)):
+    """Current caller — id, email, memberships, platform_admin."""
+    return user.to_public()
+
+
+@app.get("/api/tenants")
+def list_tenants(user: User = Depends(current_user)):
+    """Tenants the caller can see, with their role on each.
+
+    Platform admins get the full directory; everyone else sees only the
+    tenants referenced in their memberships.
+    """
+    return {"tenants": tenants.list_for_user(user)}
+
+
+@app.get("/api/tenants/{slug}")
+def tenant_detail(slug: str, user: User = Depends(current_user)):
+    """One tenant's public config. Phase 2 leaves this readable to any member;
+    Phase 3 narrows write surfaces with require_tenant_role."""
+    cfg = tenants.read_tenant_config(slug)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail="tenant not found")
+    is_member = any(m.tenant_slug == slug for m in user.memberships)
+    if not (user.platform_admin or is_member):
+        raise HTTPException(status_code=403, detail="not a member of this tenant")
+    role = next(
+        (m.role for m in user.memberships if m.tenant_slug == slug),
+        "admin" if user.platform_admin else None,
+    )
+    return {
+        "slug": cfg.get("slug", slug),
+        "name": cfg.get("name") or slug,
+        "default_format": cfg.get("default_format") or "ppt169",
+        "owner_user_id": cfg.get("owner_user_id"),
+        "created_at": cfg.get("created_at"),
+        "role": role,
+    }
 
 
 @app.get("/api/projects")
