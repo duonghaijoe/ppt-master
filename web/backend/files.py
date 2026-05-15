@@ -12,7 +12,11 @@ from watchfiles import Change, awatch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PROJECTS_DIR = REPO_ROOT / "projects"
+# Default-tenant root. Phase 1 of the multi-tenant migration re-roots
+# projects/templates under tenants/default/ while keeping the public API
+# unchanged. Real multi-tenant routing lands in Phase 3.
+DEFAULT_TENANT_ROOT = REPO_ROOT / "tenants" / "default"
+PROJECTS_DIR = DEFAULT_TENANT_ROOT / "projects"
 SCRIPTS_DIR = REPO_ROOT / "skills" / "ppt-master" / "scripts"
 SOURCE_TO_MD_DIR = SCRIPTS_DIR / "source_to_md"
 
@@ -412,7 +416,18 @@ def list_exports(name: str) -> list[dict]:
 
 
 def init_project(name: str, fmt: str = "ppt169") -> Path:
-    cmd = [_python_bin(), str(SCRIPTS_DIR / "project_manager.py"), "init", name, "--format", fmt]
+    # --dir points project_manager at the default-tenant projects root so new
+    # decks land alongside the migrated ones rather than at REPO_ROOT/projects/.
+    cmd = [
+        _python_bin(),
+        str(SCRIPTS_DIR / "project_manager.py"),
+        "init",
+        name,
+        "--format",
+        fmt,
+        "--dir",
+        str(PROJECTS_DIR),
+    ]
     proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"project_manager.py init failed:\n{proc.stderr}")

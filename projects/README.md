@@ -1,6 +1,12 @@
 # User Project Workspace
 
-This directory is used for storing in-progress projects.
+> **Phase 1 of the multi-tenant migration moved real project storage to
+> `tenants/default/projects/`.** This `projects/` directory is kept only as
+> a placeholder so this README stays at its original path. The web backend
+> resolves `/api/projects/*` against `tenants/default/projects/` automatically.
+> CLI users can pass `--dir tenants/default/projects` to `project_manager.py`.
+
+This directory describes the in-project layout convention.
 
 ## Create a New Project
 

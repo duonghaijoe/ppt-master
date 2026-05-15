@@ -169,3 +169,10 @@ PERSONAL_NOTES.md
 # Use cloud sync (iCloud/Dropbox) for backup and multi-device access
 projects/*
 !projects/README.md
+
+# Multi-tenant layout (Phase 1+). Tenant data, user records, and the
+# platform record are runtime state — never check them in. The default
+# tenant's projects mirror the same "WIP, not version-controlled" rule.
+tenants/
+users/
+.platform.json
