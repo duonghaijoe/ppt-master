@@ -12,7 +12,7 @@ Per §13 Phase 3 of web/MULTITENANT_REARCHITECTURE.md:
 - Sandbox (``Session._sandbox_deny``):
     * cross-tenant reads denied,
     * cross-tenant writes denied,
-    * platform paths (skills/, assets/, examples/) remain readable,
+    * platform paths (platform/skills/, examples/) remain readable,
     * bash deny-list covers tenants/<other>/, repo templates/, and skill
       templates/ as write destinations.
 
@@ -351,22 +351,22 @@ def test_sandbox_allows_own_tenant_read(
 def test_sandbox_allows_platform_skills_read(
     isolated_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Reads under skills/ (above tenants/) remain allowed for every tenant.
+    """Reads under platform/skills/ (above tenants/) remain allowed for every tenant.
 
-    The platform-scope tree is still in the real repo for now; we just need
-    to verify the cross-tenant check doesn't catch paths that aren't under
-    tenants/<x>/ at all.
+    The platform-scope tree lives at ``platform/skills/`` (Phase 4 move). We
+    verify the cross-tenant check doesn't catch paths that aren't under
+    ``tenants/<x>/`` at all.
     """
     import agent as agent_mod
     monkeypatch.setattr(agent_mod, "REPO_ROOT", isolated_root)
-    (isolated_root / "skills" / "ppt-master").mkdir(parents=True)
-    (isolated_root / "skills" / "ppt-master" / "SKILL.md").write_text(
+    (isolated_root / "platform" / "skills" / "ppt-master").mkdir(parents=True)
+    (isolated_root / "platform" / "skills" / "ppt-master" / "SKILL.md").write_text(
         "platform skill", encoding="utf-8"
     )
     session = _acme_session(isolated_root)
     reason = session._sandbox_deny(
         "Read",
-        {"file_path": str(isolated_root / "skills" / "ppt-master" / "SKILL.md")},
+        {"file_path": str(isolated_root / "platform" / "skills" / "ppt-master" / "SKILL.md")},
     )
     assert reason is None
 
@@ -406,9 +406,9 @@ def test_sandbox_bash_denies_skill_template_write(
     session = _acme_session(isolated_root)
     reason = session._sandbox_deny(
         "Bash",
-        {"command": "mkdir -p skills/ppt-master/templates/badtpl"},
+        {"command": "mkdir -p platform/skills/ppt-master/templates/badtpl"},
     )
-    assert reason is not None and "skills/ppt-master/templates" in reason
+    assert reason is not None and "platform/skills/ppt-master/templates" in reason
 
 
 def test_sandbox_bash_denies_repo_template_write(

@@ -33,7 +33,7 @@ from embed_icons import (  # noqa: E402
     resolve_icon_path,
 )
 
-_ICONS_DIR = REPO_ROOT / "skills" / "ppt-master" / "templates" / "icons"
+_ICONS_DIR = REPO_ROOT / "platform" / "skills" / "ppt-master" / "templates" / "icons"
 _USE_ICON_PATTERN = re.compile(r'<use\s+[^>]*data-icon="[^"]*"[^>]*/>')
 
 

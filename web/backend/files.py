@@ -20,7 +20,7 @@ TENANTS_ROOT = REPO_ROOT / "tenants"
 # compatibility.
 DEFAULT_TENANT_ROOT = TENANTS_ROOT / "default"
 PROJECTS_DIR = DEFAULT_TENANT_ROOT / "projects"
-SCRIPTS_DIR = REPO_ROOT / "skills" / "ppt-master" / "scripts"
+SCRIPTS_DIR = REPO_ROOT / "platform" / "skills" / "ppt-master" / "scripts"
 SOURCE_TO_MD_DIR = SCRIPTS_DIR / "source_to_md"
 
 
