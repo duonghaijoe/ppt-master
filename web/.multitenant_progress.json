@@ -1,15 +1,16 @@
 {
-  "current_phase": 5,
-  "completed": [1, 2, 3, 4],
+  "current_phase": 6,
+  "completed": [1, 2, 3, 4, 5],
   "blockers": [],
-  "last_commit": "dc8061a7",
+  "last_commit": "d2b3e172",
   "started_at": "2026-05-15T00:00:00Z",
   "notes": {
     "1": "PR #1 squash-merged to main as 2e066254. 8/8 phase-1 tests passed; path-mapper + tenants/default/ live.",
     "2": "PR #2 squash-merged as 4d84d890. 12/12 phase-2 tests + 8/8 phase-1 regression = 20/20 green. /api/me + /api/tenants + /api/tenants/{slug} live; dev shim DEV_USER_ID/DEV_USER_EMAIL working.",
     "3": "PR #3 squash-merged as e02f260c. 23/23 phase-3 tests + 20/20 regression = 43/43 green. Role enforcement on every route (tenant-prefixed + legacy), session ownership, agent cross-tenant sandbox via _TENANT_PATH_PATTERN, guardrail prompt updated.",
     "4": "PR #4 squash-merged as dc8061a7. 19/19 phase-4 tests + 43/43 regression = 62/62 green. skills/ → platform/skills/ via git mv (11,981 renames), /api/platform/skills (list/get/tree/file) + admin-only /api/platform/admins; agent sandbox denies .platform.json and platform/admins/secrets paths from Read and Bash.",
-    "5": "Phase 5 starting: metering capture + image-gen mediation. New providers/, metering.py, platform/billing.db, platform/pricing.json. Hook record_chat_usage into agent event loop. Move image gen behind /api/tenants/{t}/projects/{p}/images/generate."
+    "5": "PR #5 squash-merged as d2b3e172. 13/13 phase-5 tests + 62/62 regression = 75/75 green. metering.py with UsageEvent + SQLite WAL ledger at platform/billing.db; pricing.json (anthropic + openai, 20% margin, version 2026-05-15). providers/openai_images.py wraps real SDK with ProviderError → HTTP 503 (no mocks). POST /api/tenants/{t}/projects/{p}/images/generate writes into project images/ + records UsageEvent. agent.py pump loop calls record_chat_usage per SDK message; sandbox denies image_gen.py / api.openai.com from Bash. Live smoke: real PNG generated, $0.048 billed row in ledger.",
+    "6": "Phase 6 starting: billing.py + tenant caps (soft $80, hard $100, trial $20/90d defaults configurable in tenants/<t>/config.json; per-session ceiling $5). Stripe Checkout + customer portal + webhook (env STRIPE_TEST_SECRET_KEY; xfail live-call tests when absent). Platform-admin manual credit endpoint. Tenant billing page §10.7, per-session cost counter in UI."
   },
   "phase_1": {
     "branch": "feature/multitenant-phase-1",
@@ -42,6 +43,30 @@
       "api_platform_skills_endpoints_added": "PASS",
       "tenant_agent_can_read_platform_skills": "PASS",
       "tenants_cannot_list_platform_admins": "PASS"
+    }
+  },
+  "phase_5": {
+    "branch": "feature/multitenant-phase-5",
+    "pr_url": "https://github.com/duonghaijoe/ppt-master/pull/5",
+    "merged_commit": "d2b3e172",
+    "tests_status": "13/13 pass (75/75 cumulative)",
+    "verify_results": {
+      "pricing_json_seeded": "PASS",
+      "billing_db_initialized_lazily": "PASS (sqlite WAL, indexes on tenant + tenant/project)",
+      "chat_turn_produces_nonzero_usage_event": "PASS (test_chat_usage_writes_nonzero_event: $0.0126 billed)",
+      "cache_tokens_priced_at_cache_rate": "PASS (test_chat_usage_with_cache_tokens)",
+      "unknown_model_priced_zero_not_dropped": "PASS (test_chat_usage_unknown_model_priced_zero)",
+      "mtd_aggregation": "PASS (test_mtd_billed_aggregates)",
+      "image_route_requires_editor_role": "PASS",
+      "image_route_writes_file_and_event": "PASS ($0.048 billed for 1024 tier; 1536x1024 png on disk)",
+      "image_route_2k_tier_pricing": "PASS ($0.096 for 2048 tier)",
+      "image_route_missing_key_503_no_mock": "PASS",
+      "image_route_upstream_failure_503": "PASS",
+      "sandbox_bash_blocks_image_gen_py": "PASS",
+      "sandbox_bash_blocks_direct_openai_curl": "PASS",
+      "sandbox_bash_allows_local_mediated_route": "PASS",
+      "agent_pump_loop_records_chat_usage": "PASS (Session._meter_message wired before block dispatch)",
+      "live_smoke_real_openai": "PASS (default/TAMHSlide_ppt169_20260510: real PNG 2.0M + ledger row)"
     }
   },
   "phase_3": {
