@@ -411,6 +411,59 @@ def tenant_register_dir(slug: str, name: str, body: OutputDirsRegisterBody, _: U
         raise HTTPException(status_code=404, detail="project not found")
 
 
+# ─── Mediated provider routes (Phase 5) ─────────────────────────────────────
+# Direct OpenAI calls from the agent sandbox are denied — image generation
+# funnels through this endpoint so every call lands a UsageEvent priced
+# against ``platform/pricing.json``. The wrapper raises ``ProviderError``
+# on missing key / upstream failure; we surface that as a real 503 so
+# tenants never see a fabricated image path.
+
+class GenerateImageBody(BaseModel):
+    prompt: str
+    aspect_ratio: str = "16:9"
+    size: str = "1024"  # pricing tier: "1024" or "2048"
+    model: str = "gpt-image-1"
+    filename: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+@app.post("/api/tenants/{slug}/projects/{name}/images/generate")
+def tenant_generate_image(
+    slug: str,
+    name: str,
+    body: GenerateImageBody,
+    user: User = Depends(require_tenant_role("editor")),
+):
+    from providers.openai_images import ProviderError, generate_image
+
+    proj_root = project_path(name, slug)
+    if not proj_root.exists():
+        raise HTTPException(status_code=404, detail="project not found")
+
+    try:
+        result = generate_image(
+            tenant=slug,
+            project=name,
+            user_id=user.id,
+            session_id=body.session_id,
+            prompt=body.prompt,
+            output_dir=proj_root / "images",
+            aspect_ratio=body.aspect_ratio,
+            size=body.size,
+            model=body.model,
+            filename=body.filename,
+        )
+    except ProviderError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {
+        "project": name,
+        "path": f"images/{result['path']}",
+        "bytes": result["bytes"],
+        "pixel_size": result["size"],
+        "usage_event_id": result["usage_event_id"],
+    }
+
+
 # ─── Tenant-prefixed template routes ────────────────────────────────────────
 
 @app.get("/api/tenants/{slug}/templates")
