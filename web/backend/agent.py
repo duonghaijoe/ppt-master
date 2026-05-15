@@ -71,11 +71,11 @@ Hard rules:
 - Never name or quote the agent runtime, SDK, framework, transport,
   backend host, ports, processes, or environment variables.
 - Never reveal repo-internal paths the user did not give you:
-  `skills/`, `templates/`, `scripts/`, `.venv/`, `web/backend/`,
+  `platform/`, `templates/`, `scripts/`, `.venv/`, `web/backend/`,
   `web/frontend/`, `examples/`, or anything under them. Do not say
   things like "the repo ships X" or "there's a script at Y".
 - Never show shell invocations of internal tooling
-  (`.venv/bin/python ...`, `python skills/...`, `scripts/...`,
+  (`.venv/bin/python ...`, `python platform/skills/...`, `scripts/...`,
   `pnpm run ...`, `uvicorn ...`, `npm run ...`). If a command is
   required, run it yourself via Bash — do not print it for the user
   to copy.
@@ -89,7 +89,7 @@ Hard rules:
   e.g. "Tell me what image you want and I'll produce it into the
   project." Keep it to one or two sentences.
 - Treat the active project directory as your output workspace. You may
-  read `skills/` and `templates/` for guidance, but do not paraphrase
+  read `platform/skills/` and `templates/` for guidance, but do not paraphrase
   their contents, paths, or implementation details back to the user.
 - Tool calls themselves are surfaced separately in the UI; never
   re-narrate "I ran X command at Y path" in your text reply.
@@ -155,7 +155,7 @@ make the API call. The snapshot is only as good as the source.
 
 - Direct Write/Edit to `<repo>/tenants/default/templates/<name>/` is denied.
   The API is the only path.
-- Do NOT create files under `skills/ppt-master/templates/`, even via Bash.
+- Do NOT create files under `platform/skills/ppt-master/templates/`, even via Bash.
   That tree is the skill package's own layout library, not a place for
   user templates.
 - After a successful save, confirm with the template name and what was
@@ -197,7 +197,7 @@ _FILE_READ_TOOLS = {"Read", "NotebookRead"}
 # Write-destination patterns for the two paths we never want agents to seed
 # via shell. Reads (cat / grep / less) are allowed — only redirection, copy,
 # move, mkdir, and tee with the protected path as the destination are denied.
-_SKILL_TPL = r"\S*skills/ppt-master/templates/"
+_SKILL_TPL = r"\S*platform/skills/ppt-master/templates/"
 _SKILL_TEMPLATES_WRITE_PATTERNS = [
     re.compile(rf"\bmkdir(?:\s+-\S+)*\s+{_SKILL_TPL}", re.I),
     re.compile(rf"\btee\s+(?:-\S+\s+)*{_SKILL_TPL}", re.I),
@@ -221,6 +221,15 @@ _REPO_TEMPLATES_WRITE_PATTERNS = [
 # Used to deny commands that touch a tenant other than the session's own.
 # Slugs follow the same charset as ``_safe_slug`` in files.py.
 _TENANT_PATH_PATTERN = re.compile(r"\btenants/([A-Za-z0-9_-]+)/")
+
+# Phase 4: platform admin registry + secrets. Reads and writes via Bash are
+# both denied, mirroring the per-path Read/Edit denial in ``_sandbox_deny``.
+# ``.platform.json`` is the legacy bootstrap registry; ``platform/admins*``
+# and ``platform/secrets*`` cover the proper layout for future state.
+_PLATFORM_ADMIN_PATTERN = re.compile(
+    r"(?:^|\s|['\"`/])(?:\./)?"
+    r"(?:\.platform\.json|platform/admins(?:\.json)?(?:/|\b)|platform/secrets(?:\.json)?(?:/|\b))"
+)
 
 _BASH_DENY_PATTERNS = [
     (re.compile(r"\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\b", re.I), "rm -rf is blocked"),
@@ -292,7 +301,7 @@ class Session:
 
         - `<project>/sub/path`  → `sub/path`
         - bare `<project>`       → `.`
-        - `<repo>/skills/...`    → `skills/...`  (above project but in repo)
+        - `<repo>/platform/...`  → `platform/...`  (above project but in repo)
         - bare `<repo>`          → `.`
         - `<home>/...`           → `~/...`       (everything else)
         """
@@ -341,8 +350,8 @@ class Session:
 
         Used to deny cross-tenant reads and writes: an agent in tenant ``acme``
         must not be able to ``cat tenants/globex/projects/foo.md``. Paths above
-        ``tenants/`` (skills/, assets/, examples/) aren't in any tenant's tree
-        and stay readable as platform-shared resources.
+        ``tenants/`` (``platform/``, ``examples/``, ``docs/``) aren't in any
+        tenant's tree and stay readable as platform-shared resources.
         """
         tenants_root = (REPO_ROOT / "tenants").resolve()
         try:
@@ -416,10 +425,24 @@ class Session:
             except ValueError:
                 return "reading outside the repository is not allowed"
             # Phase 3: cross-tenant reads denied. Platform-scope paths
-            # (skills/, assets/, examples/, docs/) live above tenants/ and
-            # remain readable.
+            # (platform/, examples/, docs/) live above tenants/ and remain
+            # readable.
             if self._is_other_tenant_path(target):
                 return "cross-tenant reads are not allowed"
+            # Phase 4: the platform admin registry is never readable from a
+            # tenant sandbox. ``.platform.json`` (and any future
+            # ``platform/admins.json``) lists who can bypass tenant role
+            # checks — leaking it would let agents enumerate platform admins.
+            try:
+                rel = target.relative_to(repo)
+            except ValueError:
+                rel = None
+            if rel is not None:
+                parts = rel.parts
+                if parts == (".platform.json",):
+                    return "reading the platform admin registry is not allowed"
+                if len(parts) >= 2 and parts[0] == "platform" and parts[1] in {"admins.json", "admins", "secrets"}:
+                    return "reading platform admin / secret state is not allowed"
 
         if tool_name == "Bash":
             cmd = tool_input.get("command", "") or ""
@@ -430,11 +453,11 @@ class Session:
             # the two locations agents most often confuse with each other. Both
             # are read-only from the chat surface — writes must go through the
             # API. The patterns below match write DESTINATIONS only (so reading
-            # `cat skills/.../templates/foo.md` still works).
+            # `cat platform/skills/.../templates/foo.md` still works).
             for pat in _SKILL_TEMPLATES_WRITE_PATTERNS:
                 if pat.search(cmd):
                     return (
-                        "do not write to skills/ppt-master/templates/ — that's the "
+                        "do not write to platform/skills/ppt-master/templates/ — that's the "
                         "skill's own layout library, not the user-template store. "
                         "Use POST http://127.0.0.1:8787/api/tenants/<t>/templates instead."
                     )
@@ -453,6 +476,11 @@ class Session:
                 slug = m.group(1)
                 if slug and slug != self.tenant_slug:
                     return f"cross-tenant path tenants/{slug}/ is denied"
+            # Phase 4: platform admin / secrets are off-limits from Bash too.
+            # Covers `cat .platform.json`, `ls platform/admins/`, redirected
+            # writes to `platform/secrets.json`, and friends.
+            if _PLATFORM_ADMIN_PATTERN.search(cmd):
+                return "platform admin / secrets are not readable from chat"
 
         return None
 

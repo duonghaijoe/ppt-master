@@ -187,7 +187,7 @@ cd ppt-master
 pip install -r requirements.txt
 ```
 
-日常更新（方式 A / B）：`python3 skills/ppt-master/scripts/update_repo.py`
+日常更新（方式 A / B）：`python3 platform/skills/ppt-master/scripts/update_repo.py`
 
 > **方式 C — Skill marketplace**：仓库已添加 `.claude-plugin/marketplace.json` 元数据，可通过 [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces) 生态一行安装：
 >
@@ -230,7 +230,7 @@ AI 全程处理——内容分析、视觉设计、SVG 生成、PPTX 导出。
 
 > **输出说明：** 原生形状版主 `.pptx`（可直接编辑）保存至 `exports/<name>_<timestamp>.pptx`；SVG 快照版 `_svg.pptx` 与 `svg_output/` 副本归档至 `backup/<timestamp>/`，便于回溯视觉参考或免去 LLM 重跑直接重建 pptx。需要 Office 2016+。
 
-> **AI 迷失上下文？** 让它先读 `skills/ppt-master/SKILL.md`。
+> **AI 迷失上下文？** 让它先读 `platform/skills/ppt-master/SKILL.md`。
 
 > **遇到问题？** 查看 **[常见问题](./docs/zh/faq.md)** — 涵盖模型选择、排版问题、导出异常等，基于真实用户反馈持续更新。
 
@@ -247,11 +247,11 @@ cp /path/to/installed/ppt-master/.env.example ~/.ppt-master/.env
 
 PPT Master 会优先读取当前进程环境变量，然后按顺序读取第一个存在的 `.env`：当前工作目录、clone 仓库根目录、`~/.ppt-master/.env`。
 
-**A) AI 生图** — `image_gen.py`。设置 `IMAGE_BACKEND` 和对应 `*_API_KEY`（`OPENAI_API_KEY`、`GEMINI_API_KEY` 等），流程会自动调用。`python3 skills/ppt-master/scripts/image_gen.py --list-backends` 查看完整后端清单。`gpt-image-2` 目前综合质量最佳。
+**A) AI 生图** — `image_gen.py`。设置 `IMAGE_BACKEND` 和对应 `*_API_KEY`（`OPENAI_API_KEY`、`GEMINI_API_KEY` 等），流程会自动调用。`python3 platform/skills/ppt-master/scripts/image_gen.py --list-backends` 查看完整后端清单。`gpt-image-2` 目前综合质量最佳。
 
 **B) 网络图片搜索** — `image_search.py`。**零配置**可用，但高质量使用建议配置 `PEXELS_API_KEY` / `PIXABAY_API_KEY`（都免费申请）。不配置时只使用 Openverse / Wikimedia Commons，适合作为兜底，但容易出现普通用户上传、构图随意、清晰度不稳定的图片；配置后默认搜索链会追加 Pexels / Pixabay，现代商业摄影、人物、办公、生活方式和插画类图片质量会明显更稳定。默认以图片质量和匹配度优先，直接把 CC0、公有领域、Pexels / Pixabay 免署名许可、CC BY、CC BY-SA 一起纳入候选；如果选中的图片需要署名，Executor 会在该幻灯片自动添加小字署名。只有明确不能出现署名时，才使用 `--strict-no-attribution` 限制为免署名图片。对视觉要求高的封面、产品图、人物图和品牌场景，优先级建议是：用户自带高清素材 / AI 生图 > 配置 Pexels / Pixabay 的网络搜索 > 零配置网络搜索。
 
-> 完整说明：[`image-generator.md`](./skills/ppt-master/references/image-generator.md)（AI）·[`image-searcher.md`](./skills/ppt-master/references/image-searcher.md)（网络）。
+> 完整说明：[`image-generator.md`](./platform/skills/ppt-master/references/image-generator.md)（AI）·[`image-searcher.md`](./platform/skills/ppt-master/references/image-searcher.md)（网络）。
 
 ---
 
@@ -261,12 +261,12 @@ PPT Master 会优先读取当前进程环境变量，然后按顺序读取第一
 |---|------|------|
 | 🆚 | [为什么选 PPT Master](./docs/zh/why-ppt-master.md) | 与 Gamma、Copilot 等工具的对比 |
 | 🪟 | [Windows 安装指南](./docs/zh/windows-installation.md) | Windows 用户手把手安装教程 |
-| 📖 | [SKILL.md](./skills/ppt-master/SKILL.md) | 核心流程与规则 |
+| 📖 | [SKILL.md](./platform/skills/ppt-master/SKILL.md) | 核心流程与规则 |
 | 🎨 | [模板指南](./docs/zh/templates-guide.md) | 选用、派生新模板（重点）、模板边界；含 standard / fidelity 模式选型 |
-| 📐 | [画布格式](./skills/ppt-master/references/canvas-formats.md) | PPT 16:9、小红书、朋友圈等 10+ 种格式 |
+| 📐 | [画布格式](./platform/skills/ppt-master/references/canvas-formats.md) | PPT 16:9、小红书、朋友圈等 10+ 种格式 |
 | 🎬 | [转场与动画](./docs/zh/animations.md) | 页间转场和页内元素入场动画 |
 | 🎙️ | [音频旁白与视频导出](./docs/zh/audio-narration.md) | 90+ 语种 TTS 旁白、音频嵌入 PPTX、导出为 MP4 |
-| 🛠️ | [脚本与工具](./skills/ppt-master/scripts/README.md) | 所有脚本和命令 |
+| 🛠️ | [脚本与工具](./platform/skills/ppt-master/scripts/README.md) | 所有脚本和命令 |
 | 💼 | [示例](./examples/README.md) | 22 个项目，309 页 |
 | 🏗️ | [技术路线](./docs/zh/technical-design.md) | 架构、设计哲学、为什么选 SVG |
 | ❓ | [常见问题](./docs/zh/faq.md) | 模型选择、费用、排版问题排查、自定义模板 |

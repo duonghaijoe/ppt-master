@@ -451,6 +451,118 @@ def tenant_templates_delete(slug: str, name: str, _: User = Depends(require_tena
     return {"deleted": name}
 
 
+# ----------------------------------------------------------------------
+# Phase 4 — Platform scope
+# ----------------------------------------------------------------------
+#
+# The skill packages under ``platform/skills/`` are shared, read-only
+# workflow assets that every authenticated user can browse. The admin
+# registry under ``platform/admins`` (or its legacy bootstrap file
+# ``.platform.json``) is platform-admin-only — leaking it would let
+# tenants enumerate who can bypass tenant role checks.
+
+PLATFORM_DIR = REPO_ROOT / "platform"
+PLATFORM_SKILLS_DIR = PLATFORM_DIR / "skills"
+
+
+def _safe_skill_name(name: str) -> str:
+    if not name or "/" in name or ".." in name or name.startswith("."):
+        raise HTTPException(status_code=400, detail="invalid skill name")
+    return name
+
+
+def _safe_skill_path(skill: str, rel: str) -> Path:
+    skill = _safe_skill_name(skill)
+    root = (PLATFORM_SKILLS_DIR / skill).resolve()
+    if not root.exists() or not root.is_dir():
+        raise HTTPException(status_code=404, detail="skill not found")
+    candidate = (root / rel).resolve() if rel else root
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="path escapes skill root")
+    return candidate
+
+
+@app.get("/api/platform/skills")
+def platform_skills_list(_: User = Depends(current_user)):
+    """List available skill packages under ``platform/skills/``.
+
+    Authenticated users from any tenant may read this — skills are a shared
+    platform resource. The list omits hidden directories so the agent
+    sandbox view matches what users see.
+    """
+    if not PLATFORM_SKILLS_DIR.exists():
+        return {"skills": []}
+    items = []
+    for entry in sorted(PLATFORM_SKILLS_DIR.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        skill_md = entry / "SKILL.md"
+        items.append({
+            "name": entry.name,
+            "has_skill_md": skill_md.is_file(),
+        })
+    return {"skills": items}
+
+
+@app.get("/api/platform/skills/{skill}")
+def platform_skill_get(skill: str, _: User = Depends(current_user)):
+    """Return the skill's top-level metadata: name + SKILL.md preview."""
+    root = _safe_skill_path(skill, "")
+    skill_md = root / "SKILL.md"
+    body: dict = {"name": skill, "has_skill_md": skill_md.is_file()}
+    if skill_md.is_file():
+        try:
+            body["skill_md"] = skill_md.read_text(encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"read failed: {exc}")
+    return body
+
+
+@app.get("/api/platform/skills/{skill}/tree")
+def platform_skill_tree(skill: str, path: str = "", _: User = Depends(current_user)):
+    """List files/dirs under ``platform/skills/{skill}/{path}``."""
+    target = _safe_skill_path(skill, path)
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="path not found")
+    if not target.is_dir():
+        raise HTTPException(status_code=400, detail="not a directory")
+    entries = []
+    for entry in sorted(target.iterdir()):
+        if entry.name.startswith("."):
+            continue
+        entries.append({"name": entry.name, "is_dir": entry.is_dir()})
+    return {"path": path, "entries": entries}
+
+
+@app.get("/api/platform/skills/{skill}/file")
+def platform_skill_file(skill: str, path: str, _: User = Depends(current_user)):
+    """Read a single file under a platform skill (e.g. references/x.md)."""
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+    target = _safe_skill_path(skill, path)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    try:
+        content = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=415, detail="binary files are not readable here")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"read failed: {exc}")
+    return {"path": path, "content": content}
+
+
+@app.get("/api/platform/admins")
+def platform_admins_list(_: User = Depends(require_platform_admin)):
+    """List platform admins. Platform-admin only — tenants must not be able
+    to enumerate who can bypass tenant role checks (Phase 4 verify gate).
+    """
+    from users import _load_platform  # local import keeps the legacy path lazy
+    record = _load_platform()
+    return {"admins": list(record.get("admins", []))}
+
+
 @app.get("/api/projects")
 def projects_list(_: User = Depends(current_user)):
     """Legacy: lists projects under tenants/default/. Use the tenant-prefixed
