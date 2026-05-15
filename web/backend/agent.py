@@ -161,6 +161,22 @@ make the API call. The snapshot is only as good as the source.
 - After a successful save, confirm with the template name and what was
   included — do not claim "saved" until the API returned 200.
 
+## Image generation
+
+To produce a new image into the active project, use exactly one Bash call:
+
+```
+curl -sS -X POST http://127.0.0.1:8787/api/tenants/<tenant>/projects/<project>/images/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "...", "aspect_ratio": "16:9", "size": "1024"}'
+```
+
+A `200` response returns the project-relative `path` (e.g. `images/foo.png`)
+where the image was saved. Do NOT run `image_gen.py`, do NOT call
+`api.openai.com` directly, do NOT shell out to any image CLI — all of those
+are denied. The API path is the only way image generation is billed
+correctly.
+
 ## Web preview (artifact rendering)
 
 The user previews artifacts in a sandboxed iframe in the web UI. Make
@@ -244,6 +260,21 @@ _BASH_DENY_PATTERNS = [
     (re.compile(r"\bnc\s+-l\b", re.I), "netcat listen is blocked"),
     (re.compile(r">\s*\S+\.py(\s|$|;|&|\|)"), "writes to .py files are blocked"),
     (re.compile(r">>\s*\S+\.py(\s|$|;|&|\|)"), "appends to .py files are blocked"),
+    # Phase 5: direct provider access is denied — image generation must go
+    # through the mediated route so a UsageEvent is recorded. The agent
+    # prompt steers it to ``POST /api/tenants/<t>/projects/<p>/images/generate``.
+    (
+        re.compile(r"\bimage_gen(?:_openai)?\.py\b", re.I),
+        "image_gen scripts are blocked; use POST /api/tenants/<t>/projects/<p>/images/generate",
+    ),
+    (
+        re.compile(r"\bapi\.openai\.com\b", re.I),
+        "direct openai.com calls are blocked; use POST /api/tenants/<t>/projects/<p>/images/generate",
+    ),
+    (
+        re.compile(r"\bopenai\s+images\b", re.I),
+        "openai CLI is blocked; use POST /api/tenants/<t>/projects/<p>/images/generate",
+    ),
 ]
 
 
@@ -484,6 +515,54 @@ class Session:
 
         return None
 
+    def _meter_message(self, message) -> None:
+        """Record a ``UsageEvent`` for any SDK message carrying a usage block.
+
+        Phase 5 capture point. The SDK surfaces ``usage`` on ``assistant`` and
+        ``result`` messages (the Anthropic API includes a usage block per
+        turn). We funnel both into ``metering.record_chat_usage`` — zero-
+        token turns are still recorded so reconciliation can see cache-only
+        rounds. Anything that explodes here is swallowed: a metering
+        outage must never break the chat stream.
+        """
+        try:
+            import metering  # local import keeps the agent importable when
+            # the metering module's deps (sqlite, etc.) are still loading
+            usage = getattr(message, "usage", None)
+            if not usage and hasattr(message, "message"):
+                usage = getattr(message.message, "usage", None)
+            if not usage:
+                return
+            if not isinstance(usage, dict):
+                usage = {
+                    "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+                    "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+                    "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+                    "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+                }
+            model = (
+                getattr(message, "model", None)
+                or getattr(getattr(message, "message", None), "model", None)
+                or self.model
+                or "claude-sonnet-4-6"  # SDK default when unset
+            )
+            request_id = (
+                getattr(message, "id", None)
+                or getattr(getattr(message, "message", None), "id", None)
+            )
+            metering.record_chat_usage(
+                tenant=self.tenant_slug or "default",
+                project=self.project_path.name,
+                user_id=self.user_id or "",
+                session_id=self.id,
+                model=str(model),
+                usage=usage,
+                request_id=request_id,
+            )
+        except Exception:
+            # Metering failures must not break the chat surface.
+            pass
+
     def _block_to_event(self, block) -> Optional[dict]:
         """Wrap _block_to_dict with path redaction so SSE consumers never
         see absolute host paths."""
@@ -607,6 +686,7 @@ class Session:
             async def pump_sdk():
                 try:
                     async for message in client.receive_response():
+                        self._meter_message(message)
                         content = getattr(message, "content", None)
                         if isinstance(content, list):
                             for block in content:
