@@ -98,6 +98,16 @@ CREATE TABLE IF NOT EXISTS tenant_billing_state (
     stripe_customer_id          TEXT,
     updated_at                  INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS invoice_runs (
+    tenant       TEXT NOT NULL,
+    period       TEXT NOT NULL,   -- "YYYYMM" of the billed period
+    invoice_id   TEXT,            -- Stripe invoice id (NULL on dry-run / no-charge)
+    amount_usd   TEXT NOT NULL,
+    status       TEXT NOT NULL,   -- "created", "skipped_zero", "skipped_no_customer"
+    created_at   INTEGER NOT NULL,
+    PRIMARY KEY (tenant, period)
+);
 """
 
 
@@ -798,4 +808,241 @@ def handle_stripe_webhook(*, payload: bytes, signature: Optional[str]) -> dict:
         except ValueError:
             return {"ignored": True, "reason": "already credited"}
         return {"credited": True, "tenant": tenant, "amount_usd": str(amount)}
+    if etype == "invoice.payment_succeeded":
+        # Phase 9 — monthly auto-invoice settlement. Idempotent on the
+        # Stripe invoice id; the cron writes invoice_runs but credit only
+        # lands here when the customer actually pays.
+        meta = (data.get("metadata") or {}) if isinstance(data, dict) else {}
+        tenant = meta.get("tenant")
+        period = meta.get("period")
+        invoice_id = data.get("id") if isinstance(data, dict) else None
+        amount_paid_cents = data.get("amount_paid") if isinstance(data, dict) else None
+        if not tenant or not invoice_id or amount_paid_cents in (None, 0):
+            return {"ignored": True, "reason": "missing metadata or zero pay"}
+        amount = (Decimal(int(amount_paid_cents)) / Decimal(100)).quantize(Decimal("0.01"))
+        try:
+            record_credit(
+                tenant=tenant,
+                source="invoice",
+                source_id=str(invoice_id),
+                amount_usd=amount,
+                note=f"Monthly auto-invoice for {period or 'unknown'}",
+            )
+        except ValueError:
+            return {"ignored": True, "reason": "already credited"}
+        return {"invoice_paid": True, "tenant": tenant, "amount_usd": str(amount)}
     return {"ignored": True, "reason": f"unhandled event {etype}"}
+
+
+# ─── Monthly invoice cron (Phase 9) ────────────────────────────────────────
+# Sums each ``payment_mode="stripe_auto"`` tenant's billed_cost_usd for the
+# requested calendar month and creates a Stripe invoice. Idempotent on
+# ``(tenant, period)`` via the ``invoice_runs`` table — a second cron run
+# for the same period is a no-op. When Stripe is unconfigured the route
+# raises 503 (no mock invoice ever lands in the ledger).
+
+
+def _previous_period_yyyymm(now: Optional[_dt.datetime] = None) -> str:
+    """``YYYYMM`` for the calendar month immediately before ``now``."""
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    first_of_this_month = _dt.datetime(now.year, now.month, 1, tzinfo=_dt.timezone.utc)
+    last_of_prev = first_of_this_month - _dt.timedelta(days=1)
+    return f"{last_of_prev.year:04d}{last_of_prev.month:02d}"
+
+
+def _period_bounds(period_yyyymm: str) -> tuple[int, int]:
+    """Return ``(start_ts, end_ts_exclusive)`` epoch seconds for a YYYYMM string."""
+    if len(period_yyyymm) != 6 or not period_yyyymm.isdigit():
+        raise ValueError(f"period must be YYYYMM, got {period_yyyymm!r}")
+    year = int(period_yyyymm[:4])
+    month = int(period_yyyymm[4:6])
+    if not (1 <= month <= 12):
+        raise ValueError(f"invalid month in period {period_yyyymm!r}")
+    start = _dt.datetime(year, month, 1, tzinfo=_dt.timezone.utc)
+    if month == 12:
+        end = _dt.datetime(year + 1, 1, 1, tzinfo=_dt.timezone.utc)
+    else:
+        end = _dt.datetime(year, month + 1, 1, tzinfo=_dt.timezone.utc)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def _sum_billed_for_period(tenant: str, period_yyyymm: str) -> Decimal:
+    start, end = _period_bounds(period_yyyymm)
+    conn = _connect()
+    try:
+        total = Decimal("0")
+        for (billed,) in conn.execute(
+            "SELECT billed_cost FROM usage_events "
+            "WHERE tenant = ? AND created_at >= ? AND created_at < ?",
+            (tenant, start, end),
+        ):
+            try:
+                total += Decimal(str(billed))
+            except Exception:
+                continue
+        return _quant(total)
+    finally:
+        conn.close()
+
+
+def _stripe_auto_tenants() -> list[str]:
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT tenant FROM tenant_billing_state WHERE payment_mode = 'stripe_auto'"
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
+def _record_invoice_run(
+    *, tenant: str, period: str, invoice_id: Optional[str], amount_usd: Decimal, status: str
+) -> bool:
+    """Insert an invoice_runs row. Returns False when the row already exists."""
+    conn = _connect()
+    try:
+        try:
+            conn.execute(
+                "INSERT INTO invoice_runs (tenant, period, invoice_id, amount_usd, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    tenant,
+                    period,
+                    invoice_id,
+                    str(_quant(amount_usd)),
+                    status,
+                    int(time.time()),
+                ),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+    finally:
+        conn.close()
+
+
+def list_invoice_runs(*, tenant: Optional[str] = None, limit: int = 100) -> list[dict]:
+    conn = _connect()
+    try:
+        if tenant:
+            rows = conn.execute(
+                "SELECT tenant, period, invoice_id, amount_usd, status, created_at "
+                "FROM invoice_runs WHERE tenant = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (tenant, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT tenant, period, invoice_id, amount_usd, status, created_at "
+                "FROM invoice_runs ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "tenant": r[0],
+            "period": r[1],
+            "invoice_id": r[2],
+            "amount_usd": r[3],
+            "status": r[4],
+            "created_at": r[5],
+        }
+        for r in rows
+    ]
+
+
+def _create_stripe_invoice(
+    *, tenant: str, period: str, amount_usd: Decimal, customer_id: str
+) -> str:
+    """Create + finalize a Stripe invoice for the given amount. Returns the id."""
+    stripe = _require_stripe()
+    cents = int((amount_usd * Decimal(100)).quantize(Decimal("1")))
+    stripe.InvoiceItem.create(
+        customer=customer_id,
+        amount=cents,
+        currency="usd",
+        description=f"Awesome Deck usage — {tenant} — {period}",
+        metadata={"tenant": tenant, "period": period},
+    )
+    invoice = stripe.Invoice.create(
+        customer=customer_id,
+        collection_method="charge_automatically",
+        auto_advance=True,
+        metadata={"tenant": tenant, "period": period},
+    )
+    finalized = stripe.Invoice.finalize_invoice(invoice.id)
+    return finalized.id if hasattr(finalized, "id") else invoice.id
+
+
+def run_monthly_invoices(period_yyyymm: Optional[str] = None) -> dict:
+    """Iterate every ``stripe_auto`` tenant and invoice the requested period.
+
+    ``period_yyyymm`` defaults to the previous calendar month. Returns a
+    summary with the per-tenant outcome. Raises 503 if Stripe isn't
+    configured — no mock invoices ever land in the ledger.
+    """
+    if not stripe_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Stripe is not configured — cannot run monthly invoices",
+        )
+    period = period_yyyymm or _previous_period_yyyymm()
+    _period_bounds(period)  # validate shape early
+    results: list[dict] = []
+    for tenant in _stripe_auto_tenants():
+        amount = _sum_billed_for_period(tenant, period)
+        # Idempotency: if invoice_runs already has (tenant, period), skip.
+        existing = list_invoice_runs(tenant=tenant)
+        if any(r["period"] == period for r in existing):
+            results.append({"tenant": tenant, "status": "already_invoiced", "amount_usd": str(amount)})
+            continue
+        if amount <= 0:
+            _record_invoice_run(
+                tenant=tenant,
+                period=period,
+                invoice_id=None,
+                amount_usd=Decimal("0"),
+                status="skipped_zero",
+            )
+            results.append({"tenant": tenant, "status": "skipped_zero", "amount_usd": "0"})
+            continue
+        customer_id = _read_state(tenant).get("stripe_customer_id")
+        if not customer_id:
+            _record_invoice_run(
+                tenant=tenant,
+                period=period,
+                invoice_id=None,
+                amount_usd=amount,
+                status="skipped_no_customer",
+            )
+            results.append({
+                "tenant": tenant,
+                "status": "skipped_no_customer",
+                "amount_usd": str(amount),
+            })
+            continue
+        try:
+            invoice_id = _create_stripe_invoice(
+                tenant=tenant, period=period, amount_usd=amount, customer_id=customer_id
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            results.append({"tenant": tenant, "status": "error", "error": str(exc)})
+            continue
+        _record_invoice_run(
+            tenant=tenant,
+            period=period,
+            invoice_id=invoice_id,
+            amount_usd=amount,
+            status="created",
+        )
+        results.append({
+            "tenant": tenant,
+            "status": "created",
+            "invoice_id": invoice_id,
+            "amount_usd": str(amount),
+        })
+    return {"period": period, "results": results}
