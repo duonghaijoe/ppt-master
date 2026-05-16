@@ -97,19 +97,30 @@ if [[ ! -x "$VENV_PY" ]]; then
 fi
 
 stop_tracked "$BACKEND_PIDFILE" backend uvicorn
-stop_tracked "$FRONTEND_PIDFILE" frontend vite
+stop_tracked "$FRONTEND_PIDFILE" frontend npm
 
 check_port_free "$BACKEND_PORT" backend
 check_port_free "$FRONTEND_PORT" frontend
 
 echo "[backend] starting on :$BACKEND_PORT"
-( cd "$BACKEND_DIR" && PPT_DEV_AUTH=1 nohup "$VENV_PY" -m uvicorn main:app \
+# `exec` so the subshell becomes uvicorn — `$!` then captures uvicorn's pid
+# instead of a short-lived wrapper shell that exits immediately (which would
+# then have its pid recycled and confuse stop_tracked's cmd-match check).
+(
+  cd "$BACKEND_DIR"
+  exec env PPT_DEV_AUTH=1 nohup "$VENV_PY" -m uvicorn main:app \
     --host 127.0.0.1 --port "$BACKEND_PORT" \
-    > "$BACKEND_LOG" 2>&1 & echo $! > "$BACKEND_PIDFILE" )
+    > "$BACKEND_LOG" 2>&1
+) &
+echo $! > "$BACKEND_PIDFILE"
 
 echo "[frontend] starting on :$FRONTEND_PORT"
-( cd "$FRONTEND_DIR" && nohup npm run dev -- --port "$FRONTEND_PORT" \
-    > "$FRONTEND_LOG" 2>&1 & echo $! > "$FRONTEND_PIDFILE" )
+(
+  cd "$FRONTEND_DIR"
+  exec nohup npm run dev -- --port "$FRONTEND_PORT" \
+    > "$FRONTEND_LOG" 2>&1
+) &
+echo $! > "$FRONTEND_PIDFILE"
 
 wait_for "http://127.0.0.1:$BACKEND_PORT/api/health" backend "$BACKEND_LOG"
 wait_for "http://127.0.0.1:$FRONTEND_PORT" frontend "$FRONTEND_LOG"
