@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
+import { TenantSwitcher } from "./TenantSwitcher";
+import type { TenantSummary } from "../hooks/useTenants";
 
 type PermissionMode = "auto" | "confirm";
 type Format = "ppt169" | "ppt43" | "a4portrait";
@@ -24,6 +26,13 @@ const FORMAT_LABELS: Record<Format, string> = {
 };
 
 export function Dashboard({
+  activeSlug,
+  tenants,
+  tenantsLoading,
+  tenantsError,
+  isOwnerOfActiveTenant,
+  onSwitchTenant,
+  onOpenTenantSettings,
   existing,
   permissionMode,
   onPermissionChange,
@@ -32,6 +41,13 @@ export function Dashboard({
   creating,
   error,
 }: {
+  activeSlug: string | null;
+  tenants: TenantSummary[];
+  tenantsLoading: boolean;
+  tenantsError: string | null;
+  isOwnerOfActiveTenant: boolean;
+  onSwitchTenant: (slug: string) => void;
+  onOpenTenantSettings: () => void;
   existing: ProjectMeta[];
   permissionMode: PermissionMode;
   onPermissionChange: (m: PermissionMode) => void;
@@ -54,9 +70,15 @@ export function Dashboard({
   const [templatesRefresh, setTemplatesRefresh] = useState(0);
 
   useEffect(() => {
+    if (!activeSlug) {
+      setTemplates([]);
+      setTemplatesError(null);
+      setTemplatesLoading(false);
+      return;
+    }
     let cancelled = false;
     setTemplatesLoading(true);
-    fetch("/api/templates")
+    fetch(`/api/tenants/${activeSlug}/templates`)
       .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
       .then((d) => {
         if (cancelled) return;
@@ -73,7 +95,7 @@ export function Dashboard({
     return () => {
       cancelled = true;
     };
-  }, [templatesRefresh]);
+  }, [activeSlug, templatesRefresh]);
 
   const filtered = useMemo(() => {
     const list = existing.slice().sort((a, b) => (b.mtime ?? 0) - (a.mtime ?? 0));
@@ -119,6 +141,22 @@ export function Dashboard({
           <span className="ml-auto text-[10px] border border-gray-300 rounded-full px-2 py-0.5 text-gray-500 self-start">
             Beta
           </span>
+        </div>
+
+        <div className="px-5 pb-3">
+          {tenantsLoading ? (
+            <div className="text-[11px] text-gray-400 italic">Loading workspaces…</div>
+          ) : tenantsError ? (
+            <div className="text-[11px] text-red-600">{tenantsError}</div>
+          ) : (
+            <TenantSwitcher
+              tenants={tenants}
+              activeSlug={activeSlug}
+              onSelect={onSwitchTenant}
+              onOpenSettings={onOpenTenantSettings}
+              isOwnerOfActive={isOwnerOfActiveTenant}
+            />
+          )}
         </div>
 
         <div className="mx-5 mt-2 border border-[#EFE6D6] rounded-lg p-4 bg-white">
@@ -251,6 +289,7 @@ export function Dashboard({
             )
           ) : (
             <TemplatesGrid
+              activeSlug={activeSlug}
               templates={filteredTemplates}
               loading={templatesLoading}
               error={templatesError}
@@ -324,6 +363,7 @@ function ProjectCard({
 }
 
 function TemplatesGrid({
+  activeSlug,
   templates,
   loading,
   error,
@@ -333,6 +373,7 @@ function TemplatesGrid({
   onCreated,
   onDeleted,
 }: {
+  activeSlug: string | null;
   templates: TemplateMeta[];
   loading: boolean;
   error: string | null;
@@ -344,6 +385,13 @@ function TemplatesGrid({
 }) {
   const [picked, setPicked] = useState<TemplateMeta | null>(null);
 
+  if (!activeSlug) {
+    return (
+      <div className="text-sm text-gray-500 italic py-12 text-center">
+        Pick a workspace from the sidebar to see its templates.
+      </div>
+    );
+  }
   if (loading && templates.length === 0) {
     return <div className="text-sm text-gray-400 py-12 text-center">Loading templates…</div>;
   }
@@ -366,14 +414,16 @@ function TemplatesGrid({
         {templates.map((t) => (
           <TemplateCard
             key={t.name}
+            tenantSlug={activeSlug}
             template={t}
             onUse={() => setPicked(t)}
             onDelete={async () => {
               if (!confirm(`Delete template "${t.name}"? Existing projects derived from it are not affected.`)) return;
               try {
-                const res = await fetch(`/api/templates/${encodeURIComponent(t.name)}`, {
-                  method: "DELETE",
-                });
+                const res = await fetch(
+                  `/api/tenants/${activeSlug}/templates/${encodeURIComponent(t.name)}`,
+                  { method: "DELETE" },
+                );
                 if (!res.ok) throw new Error(await res.text());
                 onDeleted();
               } catch (e: any) {
@@ -385,6 +435,7 @@ function TemplatesGrid({
       </div>
       {picked && (
         <CreateFromTemplateDialog
+          tenantSlug={activeSlug}
           template={picked}
           existingProjectNames={existingProjectNames}
           permissionMode={defaultPermissionMode}
@@ -400,10 +451,12 @@ function TemplatesGrid({
 }
 
 function TemplateCard({
+  tenantSlug,
   template,
   onUse,
   onDelete,
 }: {
+  tenantSlug: string;
   template: TemplateMeta;
   onUse: () => void;
   onDelete: () => void;
@@ -414,7 +467,7 @@ function TemplateCard({
         {template.has_thumbnail ? (
           <object
             type="image/svg+xml"
-            data={`/api/templates/${encodeURIComponent(template.name)}/file?path=thumbnail.svg`}
+            data={`/api/tenants/${tenantSlug}/templates/${encodeURIComponent(template.name)}/file?path=thumbnail.svg`}
             className="w-full h-full pointer-events-none"
             aria-label={`${template.name} preview`}
           />
@@ -458,11 +511,13 @@ function TemplateCard({
 }
 
 function CreateFromTemplateDialog({
+  tenantSlug,
   template,
   existingProjectNames,
   onClose,
   onCreated,
 }: {
+  tenantSlug: string;
   template: TemplateMeta;
   existingProjectNames: string[];
   permissionMode: PermissionMode;
@@ -491,7 +546,7 @@ function CreateFromTemplateDialog({
     setBusy(true);
     setErr(null);
     try {
-      const res = await fetch("/api/projects/from-template", {
+      const res = await fetch(`/api/tenants/${tenantSlug}/projects/from-template`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
