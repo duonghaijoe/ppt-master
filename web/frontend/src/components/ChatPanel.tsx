@@ -61,6 +61,11 @@ export function ChatPanel({
 }: Props) {
   const { events, streaming, send, interrupt, respondPermission } = useSession();
   const [input, setInput] = useState("");
+  const [sessionCost, setSessionCost] = useState<{
+    cost_usd: string;
+    model: string;
+    ceiling_usd: string;
+  } | null>(null);
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [attached, setAttached] = useState<AttachedFile[]>([]);
   const [dragOver, setDragOver] = useState(false);
@@ -116,6 +121,32 @@ export function ChatPanel({
     if (!el) return;
     el.scrollTop = el.scrollHeight;
   }, [events.length, streaming]);
+
+  // Per-session cost counter. Refresh on mount and whenever a turn completes
+  // (streaming flips true → false). The backend tallies usage_events for sid.
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const r = await fetch(`/api/sessions/${sessionId}/cost`);
+        if (!r.ok) return;
+        const j = await r.json();
+        if (!cancelled) {
+          setSessionCost({
+            cost_usd: j.cost_usd ?? "0",
+            model: j.model ?? "",
+            ceiling_usd: j.ceiling_usd ?? "0",
+          });
+        }
+      } catch {
+        /* best-effort */
+      }
+    }
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, streaming]);
 
   // SVG editor → chat handoff: the slide editor builds a context-rich draft
   // ("element X at … please …") and bumps a nonce. We append (or replace if
@@ -584,6 +615,24 @@ export function ChatPanel({
                 </div>
               );
             }
+            if (b.kind === "billing") {
+              const isBlock = b.level === "block";
+              return (
+                <div
+                  key={i}
+                  className={`rounded-md border text-xs px-3 py-2 ${
+                    isBlock
+                      ? "border-red-300 bg-red-50 text-red-800"
+                      : "border-amber-300 bg-amber-50 text-amber-800"
+                  }`}
+                >
+                  <span className="font-medium mr-1">
+                    {isBlock ? "Hard cap reached" : "Soft cap crossed"}
+                  </span>
+                  {b.text}
+                </div>
+              );
+            }
             return null;
           });
         })()}
@@ -953,6 +1002,19 @@ export function ChatPanel({
                   </div>
                 )}
               </div>
+
+              {sessionCost && (
+                <span
+                  title={`This session · model ${
+                    sessionCost.model || "auto"
+                  } · ceiling $${fmt2(sessionCost.ceiling_usd)}`}
+                  className="ml-1 inline-flex items-center gap-1 text-[11px] text-gray-500 px-2 py-1 rounded-md bg-gray-50 border border-gray-200"
+                >
+                  <span className="font-mono">${fmt2(sessionCost.cost_usd)}</span>
+                  <span className="text-gray-400">·</span>
+                  <span>{modelShort(sessionCost.model)}</span>
+                </span>
+              )}
             </div>
 
             {(() => {
@@ -1172,7 +1234,8 @@ type RenderBlock =
       evt: Extract<AgentEvent, { type: "permission_request" }>;
     }
   | { kind: "error"; message: string }
-  | { kind: "done" };
+  | { kind: "done" }
+  | { kind: "billing"; level: "warn" | "block"; text: string };
 
 function groupEvents(events: AgentEvent[]): RenderBlock[] {
   const blocks: RenderBlock[] = [];
@@ -1228,11 +1291,39 @@ function groupEvents(events: AgentEvent[]): RenderBlock[] {
       blocks.push({ kind: "error", message: evt.message });
     } else if (evt.type === "done") {
       blocks.push({ kind: "done" });
+    } else if (evt.type === "billing.threshold") {
+      const pct = Math.round((evt.threshold_fraction || 0.8) * 100);
+      blocks.push({
+        kind: "billing",
+        level: "warn",
+        text: `MTD spend crossed ${pct}% of the $${fmt2(evt.cap_soft_usd)} soft cap (now $${fmt2(evt.mtd_billed_usd)}). Sessions continue; raise the cap or top up to clear.`,
+      });
+    } else if (evt.type === "billing.cap_exceeded") {
+      blocks.push({
+        kind: "billing",
+        level: "block",
+        text: `Billing blocked: MTD $${fmt2(evt.mtd_billed_usd)} reached the $${fmt2(evt.cap_hard_usd)} hard cap. New messages are paused until the cap is raised or credit is added.`,
+      });
     }
     // raw events are ignored
   }
   flush();
   return blocks;
+}
+
+function fmt2(s: string | number | undefined) {
+  const n = typeof s === "number" ? s : parseFloat(s ?? "0");
+  if (!Number.isFinite(n)) return "0.00";
+  return n.toFixed(2);
+}
+
+function modelShort(m: string) {
+  if (!m) return "Auto";
+  const lower = m.toLowerCase();
+  if (lower.includes("opus")) return "Opus";
+  if (lower.includes("sonnet")) return "Sonnet";
+  if (lower.includes("haiku")) return "Haiku";
+  return m;
 }
 
 const TOOL_LABELS: Record<string, [string, string]> = {

@@ -9,10 +9,11 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,6 +21,7 @@ from pydantic import BaseModel
 
 from agent import registry
 from authz import current_user, require_platform_admin, require_tenant_role
+import billing
 import tenants
 import users
 from users import User
@@ -464,6 +466,213 @@ def tenant_generate_image(
     }
 
 
+# ─── Billing routes (Phase 6) ──────────────────────────────────────────────
+# Surfaces the tenant's balance, trial, caps, payments, plus per-session
+# cost. Eligibility (HTTP 402) is enforced on session create / message send
+# from inline check_eligibility() calls above.
+
+
+class UpdateBillingCapsBody(BaseModel):
+    cap_soft_usd: Optional[str] = None
+    cap_hard_usd: Optional[str] = None
+
+
+class UpdateBillingPaymentBody(BaseModel):
+    payment_mode: Optional[str] = None
+    billing_email: Optional[str] = None
+
+
+class StripeCheckoutBody(BaseModel):
+    amount_usd: str
+    success_url: str
+    cancel_url: str
+
+
+class StripePortalBody(BaseModel):
+    return_url: str
+
+
+class PlatformCreditBody(BaseModel):
+    tenant: str
+    amount_usd: str
+    reference: str
+    note: Optional[str] = None
+
+
+@app.get("/api/tenants/{slug}/billing")
+def tenant_billing(
+    slug: str, user: User = Depends(require_tenant_role("viewer"))
+):
+    """Billing snapshot. Owners see the full picture; editors/viewers see
+    only their tenant's MTD usage and caps (no balances or payment state)."""
+    is_owner = user.platform_admin or any(
+        m.tenant_slug == slug and m.role == "owner" for m in user.memberships
+    )
+    if is_owner:
+        return billing.billing_summary(slug)
+    mtd = billing.metering.mtd_billed_usd(slug)
+    return {
+        "tenant": slug,
+        "mtd_billed_usd": str(mtd),
+        "cap_soft_usd": str(billing.cap_soft_usd(slug)),
+        "cap_hard_usd": str(billing.cap_hard_usd(slug)),
+        "soft_threshold_crossed": mtd
+        >= billing.cap_soft_usd(slug) * billing.SOFT_THRESHOLD_FRACTION,
+    }
+
+
+@app.get("/api/tenants/{slug}/billing/usage")
+def tenant_billing_usage(
+    slug: str,
+    limit: int = 200,
+    _: User = Depends(require_tenant_role("viewer")),
+):
+    return {"events": billing.metering.list_events(tenant=slug, limit=limit)}
+
+
+@app.get("/api/tenants/{slug}/billing/transactions")
+def tenant_billing_transactions(
+    slug: str,
+    limit: int = 100,
+    _: User = Depends(require_tenant_role("owner")),
+):
+    return {"transactions": billing.list_credits(slug, limit=limit)}
+
+
+@app.patch("/api/tenants/{slug}/billing/caps")
+def tenant_billing_caps(
+    slug: str,
+    body: UpdateBillingCapsBody,
+    user: User = Depends(require_tenant_role("owner")),
+):
+    """Owners can raise/lower their soft cap (up to hard). Hard-cap edits
+    are platform-admin-only — a compromised owner shouldn't be able to
+    push the safety net higher."""
+    result = {}
+    if body.cap_soft_usd is not None:
+        try:
+            result["cap_soft_usd"] = str(
+                billing.set_soft_cap(slug, Decimal(body.cap_soft_usd))
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    if body.cap_hard_usd is not None:
+        if not user.platform_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="hard-cap raise requires platform admin",
+            )
+        try:
+            result["cap_hard_usd"] = str(
+                billing.set_hard_cap(slug, Decimal(body.cap_hard_usd))
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    return result
+
+
+@app.patch("/api/tenants/{slug}/billing/payment")
+def tenant_billing_payment(
+    slug: str,
+    body: UpdateBillingPaymentBody,
+    _: User = Depends(require_tenant_role("owner")),
+):
+    """Toggle payment_mode and update the billing email."""
+    out = {}
+    if body.payment_mode is not None:
+        try:
+            out["payment_mode"] = billing.set_payment_mode(slug, body.payment_mode)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    if body.billing_email is not None:
+        out["billing_email"] = billing.set_billing_email(slug, body.billing_email)
+    return out
+
+
+@app.post("/api/tenants/{slug}/billing/checkout")
+def tenant_billing_checkout(
+    slug: str,
+    body: StripeCheckoutBody,
+    _: User = Depends(require_tenant_role("owner")),
+):
+    """Create a Stripe Checkout session for a prepaid top-up."""
+    try:
+        amount = Decimal(body.amount_usd)
+    except Exception:
+        raise HTTPException(status_code=400, detail="amount_usd must be a decimal")
+    url = billing.create_checkout_session(
+        tenant=slug,
+        amount_usd=amount,
+        success_url=body.success_url,
+        cancel_url=body.cancel_url,
+    )
+    return {"url": url}
+
+
+@app.post("/api/tenants/{slug}/billing/portal")
+def tenant_billing_portal(
+    slug: str,
+    body: StripePortalBody,
+    _: User = Depends(require_tenant_role("owner")),
+):
+    """Open the tenant's Stripe Customer Portal."""
+    url = billing.create_portal_session(tenant=slug, return_url=body.return_url)
+    return {"url": url}
+
+
+@app.post("/api/platform/billing/credit")
+def platform_billing_credit(
+    body: PlatformCreditBody, _: User = Depends(require_platform_admin)
+):
+    """Record a manual credit (wire transfer, adjustment). Idempotent on
+    (tenant, reference). The reference doubles as the source_id so the
+    same wire can't double-credit."""
+    if not tenants.tenant_exists(body.tenant):
+        raise HTTPException(status_code=404, detail="tenant not found")
+    try:
+        amount = Decimal(body.amount_usd)
+    except Exception:
+        raise HTTPException(status_code=400, detail="amount_usd must be a decimal")
+    try:
+        txn = billing.record_credit(
+            tenant=body.tenant,
+            source="manual",
+            source_id=body.reference,
+            amount_usd=amount,
+            note=body.note or "",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "id": txn.id,
+        "tenant": txn.tenant,
+        "amount_usd": str(txn.amount_usd),
+        "source": txn.source,
+        "source_id": txn.source_id,
+        "balance_usd": str(billing.balance_usd(body.tenant)),
+    }
+
+
+@app.post("/api/billing/stripe/webhook")
+async def stripe_webhook(request: Request):
+    """Stripe webhook ingress — signature-verified, idempotent on event id."""
+    payload = await request.body()
+    signature = request.headers.get("Stripe-Signature")
+    return billing.handle_stripe_webhook(payload=payload, signature=signature)
+
+
+@app.get("/api/sessions/{sid}/cost")
+def session_cost(sid: str, user: User = Depends(current_user)):
+    """Per-session cost counter for the chat footer."""
+    session = _resolve_session_for_user(sid, user)
+    return {
+        "session_id": sid,
+        "cost_usd": str(billing.session_cost_usd(sid)),
+        "model": session.model,
+        "ceiling_usd": str(billing.session_ceiling_usd(session.tenant_slug or "default")),
+    }
+
+
 # ─── Tenant-prefixed template routes ────────────────────────────────────────
 
 @app.get("/api/tenants/{slug}/templates")
@@ -707,6 +916,9 @@ async def create_session(
     """Legacy: defaults to the ``default`` tenant. Tenant-prefixed callers
     should use ``POST /api/tenants/{slug}/sessions`` instead."""
     _ensure_default_editor(user)
+    billing.check_eligibility(
+        "default", billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
+    )
     try:
         proj = init_project(body.name, body.format, slug="default")
     except RuntimeError as e:
@@ -732,6 +944,9 @@ async def attach_session(
 ):
     """Attach a session to an existing project (no init). Legacy default-tenant alias."""
     _ensure_default_editor(user)
+    billing.check_eligibility(
+        "default", billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
+    )
     proj = project_path(body.name, slug="default")
     if not proj.exists():
         raise HTTPException(status_code=404, detail=f"project not found: {body.name}")
@@ -756,6 +971,9 @@ async def create_tenant_session(
 ):
     """Create a session bound to a specific tenant. Caller must be at
     least editor on the tenant — viewers cannot run agent chats."""
+    billing.check_eligibility(
+        slug, billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
+    )
     try:
         proj = init_project(body.name, body.format, slug=slug)
     except RuntimeError as e:
@@ -781,6 +999,9 @@ async def attach_tenant_session(
     user: User = Depends(require_tenant_role("editor")),
 ):
     """Attach a session to an existing project under a specific tenant."""
+    billing.check_eligibility(
+        slug, billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
+    )
     proj = project_path(body.name, slug=slug)
     if not proj.exists():
         raise HTTPException(status_code=404, detail=f"project not found: {body.name}")
@@ -844,9 +1065,32 @@ async def delete_session(sid: str, user: User = Depends(current_user)):
 @app.post("/api/sessions/{sid}/message")
 async def send_message(sid: str, body: ChatBody, user: User = Depends(current_user)):
     session = _resolve_session_for_user(sid, user)
+    # Per §17.4: re-check eligibility before each new message — an in-flight
+    # session may have crossed the hard cap mid-turn.
+    billing.check_eligibility(
+        session.tenant_slug or "default", billing.estimate_cost_usd(session.model)
+    )
+    # Per-session ceiling guard — protects a runaway loop from blowing past
+    # tenant-level caps. We compare against the snapshot before this turn.
+    sc = billing.session_cost_usd(session.id)
+    ceiling = billing.session_ceiling_usd(session.tenant_slug or "default")
+    if ceiling > 0 and sc >= ceiling:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "error": "session_ceiling_reached",
+                "session_cost_usd": str(sc),
+                "session_ceiling_usd": str(ceiling),
+            },
+        )
 
     async def event_stream() -> AsyncIterator[bytes]:
         try:
+            threshold_evt = billing.maybe_emit_soft_threshold(
+                session.tenant_slug or "default"
+            )
+            if threshold_evt is not None:
+                yield f"data: {json.dumps(threshold_evt)}\n\n".encode("utf-8")
             async for evt in session.send(body.text):
                 yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n".encode("utf-8")
         except Exception as e:

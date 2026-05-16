@@ -19,6 +19,7 @@ export function ProjectHeader({
   onSwitchProject,
   onNewChat,
   onSelectThread,
+  onOpenBilling,
 }: {
   project: string;
   threads: ThreadEntry[];
@@ -28,6 +29,7 @@ export function ProjectHeader({
   onNewChat: () => void;
   onSelectThread: (id: string) => void;
   onPermissionChange?: (m: PermissionMode) => void;
+  onOpenBilling?: () => void;
 }) {
   const [historyOpen, setHistoryOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -100,6 +102,16 @@ export function ProjectHeader({
         )}
       </div>
 
+      {onOpenBilling && (
+        <button
+          onClick={onOpenBilling}
+          title="Billing · caps · transactions"
+          className="w-8 h-8 rounded-full flex items-center justify-center text-gray-500 hover:bg-gray-100 shrink-0"
+        >
+          <DollarIcon className="w-4 h-4" />
+        </button>
+      )}
+
       <button
         onClick={onNewChat}
         title="New chat on this project"
@@ -108,6 +120,23 @@ export function ProjectHeader({
         <PlusIcon className="w-4 h-4" />
       </button>
     </header>
+  );
+}
+
+function DollarIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+    >
+      <line x1="12" y1="2" x2="12" y2="22" />
+      <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+    </svg>
   );
 }
 
