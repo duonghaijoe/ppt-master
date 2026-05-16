@@ -20,7 +20,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent import registry
-from authz import current_user, require_platform_admin, require_tenant_role
+from authz import (
+    current_user,
+    require_platform_admin,
+    require_project_role,
+    require_tenant_role,
+    resolve_project_role,
+)
 import billing
 import tenants
 import users
@@ -422,19 +428,19 @@ def tenant_projects_list(slug: str, _: User = Depends(require_tenant_role("viewe
 
 
 @app.get("/api/tenants/{slug}/projects/{name}/slides")
-def tenant_slides(slug: str, name: str, dir: str | None = None, _: User = Depends(require_tenant_role("viewer"))):
+def tenant_slides(slug: str, name: str, dir: str | None = None, _: User = Depends(require_project_role("viewer"))):
     if dir:
         return {"project": name, "slides": list_dir_slides(name, dir, slug)}
     return {"project": name, "slides": list_slides(name, slug)}
 
 
 @app.get("/api/tenants/{slug}/projects/{name}/exports")
-def tenant_exports(slug: str, name: str, _: User = Depends(require_tenant_role("viewer"))):
+def tenant_exports(slug: str, name: str, _: User = Depends(require_project_role("viewer"))):
     return {"project": name, "exports": list_exports(name, slug)}
 
 
 @app.get("/api/tenants/{slug}/projects/{name}/recent")
-def tenant_recent(slug: str, name: str, limit: int = 20, _: User = Depends(require_tenant_role("viewer"))):
+def tenant_recent(slug: str, name: str, limit: int = 20, _: User = Depends(require_project_role("viewer"))):
     if not project_path(name, slug).exists():
         raise HTTPException(status_code=404, detail="project not found")
     if limit < 1:
@@ -449,7 +455,7 @@ def tenant_recent(slug: str, name: str, limit: int = 20, _: User = Depends(requi
 
 
 @app.get("/api/tenants/{slug}/projects/{name}/tree")
-def tenant_project_tree(slug: str, name: str, path: str = "", _: User = Depends(require_tenant_role("viewer"))):
+def tenant_project_tree(slug: str, name: str, path: str = "", _: User = Depends(require_project_role("viewer"))):
     if not project_path(name, slug).exists():
         raise HTTPException(status_code=404, detail="project not found")
     try:
@@ -461,7 +467,7 @@ def tenant_project_tree(slug: str, name: str, path: str = "", _: User = Depends(
 
 
 @app.get("/api/tenants/{slug}/projects/{name}/file")
-def tenant_project_file(slug: str, name: str, path: str, _: User = Depends(require_tenant_role("viewer"))):
+def tenant_project_file(slug: str, name: str, path: str, _: User = Depends(require_project_role("viewer"))):
     if not project_path(name, slug).exists():
         raise HTTPException(status_code=404, detail="project not found")
     try:
@@ -480,7 +486,7 @@ def tenant_project_file(slug: str, name: str, path: str, _: User = Depends(requi
 
 
 @app.get("/api/tenants/{slug}/projects/{name}/output-dirs")
-def tenant_output_dirs(slug: str, name: str, _: User = Depends(require_tenant_role("viewer"))):
+def tenant_output_dirs(slug: str, name: str, _: User = Depends(require_project_role("viewer"))):
     if not project_path(name, slug).exists():
         raise HTTPException(status_code=404, detail="project not found")
     try:
@@ -500,7 +506,7 @@ def tenant_output_dirs(slug: str, name: str, _: User = Depends(require_tenant_ro
 
 
 @app.put("/api/tenants/{slug}/projects/{name}/output-dirs")
-def tenant_put_output_dirs(slug: str, name: str, body: OutputDirsBody, _: User = Depends(require_tenant_role("editor"))):
+def tenant_put_output_dirs(slug: str, name: str, body: OutputDirsBody, _: User = Depends(require_project_role("editor"))):
     if not project_path(name, slug).exists():
         raise HTTPException(status_code=404, detail="project not found")
     try:
@@ -510,7 +516,7 @@ def tenant_put_output_dirs(slug: str, name: str, body: OutputDirsBody, _: User =
 
 
 @app.post("/api/tenants/{slug}/projects/{name}/output-dirs/register")
-def tenant_register_dir(slug: str, name: str, body: OutputDirsRegisterBody, _: User = Depends(require_tenant_role("editor"))):
+def tenant_register_dir(slug: str, name: str, body: OutputDirsRegisterBody, _: User = Depends(require_project_role("editor"))):
     if not project_path(name, slug).exists():
         raise HTTPException(status_code=404, detail="project not found")
     try:
@@ -519,6 +525,106 @@ def tenant_register_dir(slug: str, name: str, body: OutputDirsRegisterBody, _: U
         raise HTTPException(status_code=400, detail=str(e))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="project not found")
+
+
+# ─── Project sharing (Phase 8) ──────────────────────────────────────────────
+# Per §6.2 / §7.4: only home-tenant owners (or platform admins) can manage
+# a project's shares. A user shared as editor on a project does NOT inherit
+# the right to re-share — preventing transitive grants. The .project.json
+# state is the only source of truth for who's shared with; resolution lives
+# in authz.resolve_project_role.
+
+
+class ProjectShareBody(BaseModel):
+    user_id: Optional[str] = None
+    email: Optional[str] = None
+    tenant_slug: Optional[str] = None
+    role: Optional[str] = None  # required for user shares; ignored for tenant shares
+
+
+@app.get("/api/tenants/{slug}/projects/{name}/share")
+def tenant_project_share_list(
+    slug: str, name: str, _: User = Depends(require_project_role("viewer"))
+):
+    """Return current grants. Viewer+ can see them so the share dialog can
+    show the list to anyone with read access — only the write paths gate on
+    owner."""
+    try:
+        meta = tenants.read_project_meta(slug, name)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="project not found")
+    return {
+        "acl": meta.get("acl", []),
+        "shared_with_tenants": meta.get("shared_with_tenants", []),
+    }
+
+
+@app.post("/api/tenants/{slug}/projects/{name}/share")
+def tenant_project_share_add(
+    slug: str,
+    name: str,
+    body: ProjectShareBody,
+    _: User = Depends(require_tenant_role("owner")),
+):
+    """Add a share. Body must specify exactly one of ``user_id``, ``email``,
+    or ``tenant_slug``. ``role`` is required for user shares (viewer/editor/
+    owner); tenant shares are capped at editor regardless of role passed."""
+    targets = [k for k in ("user_id", "email", "tenant_slug") if getattr(body, k)]
+    if len(targets) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="provide exactly one of user_id, email, tenant_slug",
+        )
+    if not project_path(name, slug).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        if body.tenant_slug:
+            meta = tenants.add_project_share_tenant(slug, name, body.tenant_slug)
+        else:
+            user_id = body.user_id or ""
+            if body.email:
+                target = users.find_by_email(body.email)
+                if target is None:
+                    raise HTTPException(
+                        status_code=404, detail=f"no user with email {body.email}"
+                    )
+                user_id = target.id
+            role = body.role or ""
+            meta = tenants.add_project_share_user(slug, name, user_id, role)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "acl": meta.get("acl", []),
+        "shared_with_tenants": meta.get("shared_with_tenants", []),
+    }
+
+
+@app.delete("/api/tenants/{slug}/projects/{name}/share/{principal}")
+def tenant_project_share_remove(
+    slug: str,
+    name: str,
+    principal: str,
+    _: User = Depends(require_tenant_role("owner")),
+):
+    """Remove a single grant. ``principal`` is ``user:<id>`` or ``tenant:<slug>``.
+    404 when the principal isn't currently listed so the UI can distinguish
+    "already gone" from a transient failure."""
+    if not project_path(name, slug).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        meta = tenants.remove_project_share(slug, name, principal)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="principal not shared with")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "acl": meta.get("acl", []),
+        "shared_with_tenants": meta.get("shared_with_tenants", []),
+    }
 
 
 # ─── Mediated provider routes (Phase 5) ─────────────────────────────────────
@@ -542,7 +648,7 @@ def tenant_generate_image(
     slug: str,
     name: str,
     body: GenerateImageBody,
-    user: User = Depends(require_tenant_role("editor")),
+    user: User = Depends(require_project_role("editor")),
 ):
     from providers.openai_images import ProviderError, generate_image
 
@@ -1152,9 +1258,19 @@ async def create_tenant_session(
 async def attach_tenant_session(
     slug: str,
     body: AttachSessionBody,
-    user: User = Depends(require_tenant_role("editor")),
+    user: User = Depends(current_user),
 ):
-    """Attach a session to an existing project under a specific tenant."""
+    """Attach a session to an existing project under a specific tenant.
+
+    Uses the project-level role resolver so a cross-tenant share (§6.2 ACL or
+    ``shared_with_tenants``) is sufficient — a viewer can attach a read-only
+    session, an editor can drive the agent."""
+    if tenants.read_tenant_config(slug) is None:
+        raise HTTPException(status_code=404, detail="tenant not found")
+    role = resolve_project_role(user, slug, body.name)
+    if role is None or role == "viewer":
+        # Viewer can browse files but not run the agent — sessions imply writes.
+        raise HTTPException(status_code=403, detail="editor role required to attach a session")
     billing.check_eligibility(
         slug, billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
     )

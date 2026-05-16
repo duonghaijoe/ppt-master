@@ -548,6 +548,127 @@ def delete_shared_asset(slug: str, rel: str) -> None:
         parent = parent.parent
 
 
+# ─── Project ACL (Phase 8) ──────────────────────────────────────────────────
+# Per §6.2 / §7.4: a project's .project.json carries optional `acl` (per-user
+# grants) and `shared_with_tenants` (whole-tenant grants capped at editor).
+# These helpers read/write that file atomically and never invent semantics —
+# resolution lives in ``authz.resolve_project_role``.
+
+_PROJECT_ACL_ROLES = {"viewer", "editor", "owner"}
+
+
+def _project_meta_path(slug: str, project_name: str) -> Path:
+    if not project_name or "/" in project_name or ".." in project_name or project_name.startswith("."):
+        raise ValueError(f"invalid project name: {project_name!r}")
+    return tenant_dir(slug) / "projects" / project_name / ".project.json"
+
+
+def read_project_meta(slug: str, project_name: str) -> dict:
+    """Return the project's ACL metadata (always with both keys present).
+
+    Missing file returns the empty shape ``{"acl": [], "shared_with_tenants": []}``
+    so callers don't branch on existence. Raises ``FileNotFoundError`` if the
+    *project* itself is missing — distinguishing "no shares yet" from "no
+    such project" is load-bearing for the share endpoints.
+    """
+    meta_path = _project_meta_path(slug, project_name)
+    project_root = meta_path.parent
+    if not project_root.exists() or not project_root.is_dir():
+        raise FileNotFoundError(project_name)
+    if not meta_path.exists():
+        return {"acl": [], "shared_with_tenants": []}
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"acl": [], "shared_with_tenants": []}
+    acl = data.get("acl") if isinstance(data.get("acl"), list) else []
+    shared = data.get("shared_with_tenants") if isinstance(data.get("shared_with_tenants"), list) else []
+    cleaned_acl = []
+    for e in acl:
+        if not isinstance(e, dict):
+            continue
+        uid = str(e.get("user_id", "")).strip()
+        role = str(e.get("role", "")).strip().lower()
+        if uid and role in _PROJECT_ACL_ROLES:
+            cleaned_acl.append({"user_id": uid, "role": role})
+    cleaned_shared = sorted({str(s).strip() for s in shared if isinstance(s, str) and s.strip()})
+    out = dict(data)
+    out["acl"] = cleaned_acl
+    out["shared_with_tenants"] = cleaned_shared
+    return out
+
+
+def _write_project_meta(slug: str, project_name: str, meta: dict) -> None:
+    meta_path = _project_meta_path(slug, project_name)
+    if not meta_path.parent.exists():
+        raise FileNotFoundError(project_name)
+    _write_json(meta_path, meta)
+
+
+def add_project_share_user(slug: str, project_name: str, user_id: str, role: str) -> dict:
+    """Grant ``user_id`` the given role on the project. Idempotent on user_id —
+    re-sharing with a different role overwrites in place."""
+    role = (role or "").strip().lower()
+    if role not in _PROJECT_ACL_ROLES:
+        raise ValueError(f"invalid role: {role!r}")
+    uid = (user_id or "").strip()
+    if not uid:
+        raise ValueError("user_id is required")
+    meta = read_project_meta(slug, project_name)
+    acl = [e for e in meta.get("acl", []) if e.get("user_id") != uid]
+    acl.append({"user_id": uid, "role": role})
+    meta["acl"] = acl
+    _write_project_meta(slug, project_name, meta)
+    return meta
+
+
+def add_project_share_tenant(slug: str, project_name: str, tenant_slug: str) -> dict:
+    """Grant every member of ``tenant_slug`` the project's home-tenant role
+    capped at editor. Resolution still happens at request time; this only
+    records the grant."""
+    target = _safe_slug(tenant_slug)
+    if not tenant_exists(target):
+        raise FileNotFoundError(f"tenant not found: {tenant_slug}")
+    if target == slug:
+        raise ValueError("cannot share a project with its own home tenant")
+    meta = read_project_meta(slug, project_name)
+    shared = set(meta.get("shared_with_tenants", []))
+    shared.add(target)
+    meta["shared_with_tenants"] = sorted(shared)
+    _write_project_meta(slug, project_name, meta)
+    return meta
+
+
+def remove_project_share(slug: str, project_name: str, principal: str) -> dict:
+    """Remove a principal grant by its ``user:<id>`` or ``tenant:<slug>`` token.
+
+    Returns the updated meta. Raises ``KeyError`` when the principal is not
+    currently listed — the route layer surfaces that as 404 so the UI can
+    distinguish "already gone" from a transient failure."""
+    if not principal or ":" not in principal:
+        raise ValueError("principal must be 'user:<id>' or 'tenant:<slug>'")
+    kind, _, value = principal.partition(":")
+    value = value.strip()
+    if not value:
+        raise ValueError("principal value missing")
+    meta = read_project_meta(slug, project_name)
+    if kind == "user":
+        before = len(meta.get("acl", []))
+        meta["acl"] = [e for e in meta.get("acl", []) if e.get("user_id") != value]
+        if len(meta["acl"]) == before:
+            raise KeyError(principal)
+    elif kind == "tenant":
+        shared = set(meta.get("shared_with_tenants", []))
+        if value not in shared:
+            raise KeyError(principal)
+        shared.discard(value)
+        meta["shared_with_tenants"] = sorted(shared)
+    else:
+        raise ValueError(f"unknown principal kind: {kind!r}")
+    _write_project_meta(slug, project_name, meta)
+    return meta
+
+
 def list_for_user(user: User) -> list[dict]:
     """Tenants the user can see, with their role per tenant.
 

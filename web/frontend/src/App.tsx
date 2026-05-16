@@ -34,6 +34,7 @@ type ProjectMeta = { name: string; slides: number; exports?: number; mtime?: num
 
 export function App() {
   const {
+    me,
     tenants,
     activeSlug,
     activeTenant,
@@ -308,6 +309,13 @@ export function App() {
     );
   }
 
+  const sessionTenant = session.tenant_slug ?? activeSlug ?? null;
+  const canManageShares =
+    !!me?.platform_admin ||
+    !!(sessionTenant && me?.memberships.some(
+      (m) => m.tenant_slug === sessionTenant && m.role === "owner",
+    ));
+
   return (
     <SessionShell
       key={hydrated?.nonce ?? "init"}
@@ -316,6 +324,8 @@ export function App() {
       threads={threads}
       threadId={threadId}
       projects={existing}
+      tenantSlug={sessionTenant}
+      canManageShares={canManageShares}
       onPermissionChange={changeMode}
       onTierChange={changeTier}
       onSwitchProject={exitSession}
@@ -347,6 +357,8 @@ function SessionShell({
   threads,
   threadId,
   projects,
+  tenantSlug,
+  canManageShares,
   onPermissionChange,
   onTierChange,
   onSwitchProject,
@@ -359,6 +371,8 @@ function SessionShell({
   threads: ThreadEntry[];
   threadId: string | null;
   projects: ProjectMeta[];
+  tenantSlug: string | null;
+  canManageShares: boolean;
   onPermissionChange: (m: PermissionMode) => void;
   onTierChange: (t: ModelTier) => void;
   onSwitchProject: () => void;
@@ -401,6 +415,8 @@ function SessionShell({
         <aside className="bg-white border-r border-gray-200 flex flex-col min-h-0 min-w-0">
           <ProjectHeader
             project={session.project}
+            tenantSlug={tenantSlug}
+            canManageShares={canManageShares}
             threads={threads}
             activeThreadId={threadId}
             permissionMode={session.permission_mode}
