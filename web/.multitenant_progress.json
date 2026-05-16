@@ -1,8 +1,8 @@
 {
-  "current_phase": 6,
-  "completed": [1, 2, 3, 4, 5],
+  "current_phase": 7,
+  "completed": [1, 2, 3, 4, 5, 6],
   "blockers": [],
-  "last_commit": "d2b3e172",
+  "last_commit": "a763cf3e",
   "started_at": "2026-05-15T00:00:00Z",
   "notes": {
     "1": "PR #1 squash-merged to main as 2e066254. 8/8 phase-1 tests passed; path-mapper + tenants/default/ live.",
@@ -10,7 +10,7 @@
     "3": "PR #3 squash-merged as e02f260c. 23/23 phase-3 tests + 20/20 regression = 43/43 green. Role enforcement on every route (tenant-prefixed + legacy), session ownership, agent cross-tenant sandbox via _TENANT_PATH_PATTERN, guardrail prompt updated.",
     "4": "PR #4 squash-merged as dc8061a7. 19/19 phase-4 tests + 43/43 regression = 62/62 green. skills/ → platform/skills/ via git mv (11,981 renames), /api/platform/skills (list/get/tree/file) + admin-only /api/platform/admins; agent sandbox denies .platform.json and platform/admins/secrets paths from Read and Bash.",
     "5": "PR #5 squash-merged as d2b3e172. 13/13 phase-5 tests + 62/62 regression = 75/75 green. metering.py with UsageEvent + SQLite WAL ledger at platform/billing.db; pricing.json (anthropic + openai, 20% margin, version 2026-05-15). providers/openai_images.py wraps real SDK with ProviderError → HTTP 503 (no mocks). POST /api/tenants/{t}/projects/{p}/images/generate writes into project images/ + records UsageEvent. agent.py pump loop calls record_chat_usage per SDK message; sandbox denies image_gen.py / api.openai.com from Bash. Live smoke: real PNG generated, $0.048 billed row in ledger.",
-    "6": "Phase 6 starting: billing.py + tenant caps (soft $80, hard $100, trial $20/90d defaults configurable in tenants/<t>/config.json; per-session ceiling $5). Stripe Checkout + customer portal + webhook (env STRIPE_TEST_SECRET_KEY; xfail live-call tests when absent). Platform-admin manual credit endpoint. Tenant billing page §10.7, per-session cost counter in UI."
+    "6": "PR #6 squash-merged as a763cf3e. 22/22 phase-6 tests (1 xfail for missing STRIPE_TEST_SECRET_KEY) + 75/75 regression = 97/97 green. billing.py ledger (trial $20/90d, cap_soft $80, cap_hard $100, session_ceiling $5 — all configurable in tenants/<t>/config.json billing block + DB overrides). check_eligibility() gates legacy + tenant-prefixed session create AND message send with HTTP 402 (hard_cap_exceeded or insufficient_balance). Soft-threshold watermark — one billing.threshold SSE event per crossing, resets when MTD drops. Stripe Checkout + customer portal + signature-verified webhook (lazy stripe import, 503 when key absent — no mocks). /api/platform/billing/credit idempotent on (tenant, reference). BillingDrawer frontend with owner/viewer split: balance, trial, MTD, cap progress bars, soft-cap editor, Stripe top-up + portal, manual-pay contact block, usage + transactions tabs. Per-session cost counter ($X · Model badge) in ChatPanel toolbar — refreshes after each turn via /api/sessions/{sid}/cost. useAgentStream surfaces 402 responses as billing.cap_exceeded events; ChatPanel renders billing.threshold + billing.cap_exceeded as amber/red banners. Live smoke verified: cap_hard=$0.10 produces 402 on session create; $50 manual credit landed instantly on $20-trial tenant for $70 balance."
   },
   "phase_1": {
     "branch": "feature/multitenant-phase-1",
@@ -67,6 +67,36 @@
       "sandbox_bash_allows_local_mediated_route": "PASS",
       "agent_pump_loop_records_chat_usage": "PASS (Session._meter_message wired before block dispatch)",
       "live_smoke_real_openai": "PASS (default/TAMHSlide_ppt169_20260510: real PNG 2.0M + ledger row)"
+    }
+  },
+  "phase_6": {
+    "branch": "feature/multitenant-phase-6",
+    "pr_url": "https://github.com/duonghaijoe/ppt-master/pull/6",
+    "merged_commit": "a763cf3e",
+    "tests_status": "22/22 pass + 1 xfail (97/97 cumulative)",
+    "verify_results": {
+      "billing_module_balance_trial_caps_transactions": "PASS",
+      "check_eligibility_hard_cap_402_path": "PASS (live: hard=$0.10 → 402 hard_cap_exceeded on POST /api/tenants/<t>/sessions)",
+      "soft_threshold_event_idempotent_per_crossing": "PASS (test_soft_threshold_emits_once_then_silences)",
+      "soft_threshold_resets_when_mtd_drops": "PASS",
+      "hard_cap_blocks_message_send": "PASS (test_message_blocked_when_hard_cap_exceeded)",
+      "per_session_ceiling_402": "PASS (test_session_ceiling_blocks_after_threshold)",
+      "stripe_checkout_route": "CODE-ONLY (xfail live without STRIPE_TEST_SECRET_KEY — 503 path verified)",
+      "stripe_customer_portal_route": "CODE-ONLY (same)",
+      "stripe_webhook_signature_verified_idempotent": "CODE-ONLY (xfail live)",
+      "platform_manual_credit_endpoint": "PASS (live: $50 wire → balance $70 on $20-trial tenant; idempotent on reference)",
+      "owner_can_raise_lower_soft_cap": "PASS",
+      "owner_cannot_raise_hard_cap": "PASS (test_owner_cannot_raise_hard_cap)",
+      "platform_admin_can_raise_hard_cap": "PASS",
+      "soft_cap_cannot_exceed_hard_cap": "PASS",
+      "billing_summary_owner_view": "PASS (balance + trial + caps + payment fields)",
+      "billing_summary_viewer_view_no_balance": "PASS (mtd + caps + soft_threshold_crossed only)",
+      "tenant_billing_page_10_7_owner_full": "CODE-ONLY (BillingDrawer renders all required sections — header, soft-cap editor, top-up/portal or contact-billing, usage + transactions; UI not exercised in browser this loop)",
+      "tenant_billing_page_10_7_viewer_slim": "CODE-ONLY (transactions tab disabled when no balance; isOwner gate)",
+      "per_session_cost_counter_in_chat_footer": "CODE-ONLY (ChatPanel toolbar badge — fetches /api/sessions/{sid}/cost on mount and after each turn)",
+      "ui_billing_threshold_banner": "CODE-ONLY (ChatPanel renders billing.threshold as amber banner)",
+      "ui_billing_cap_exceeded_banner": "CODE-ONLY (ChatPanel renders 402 + billing.cap_exceeded as red banner via useAgentStream surfacing)",
+      "no_mock_provider_calls": "PASS (Stripe absent → HTTP 503; never returns fake URL)"
     }
   },
   "phase_3": {
