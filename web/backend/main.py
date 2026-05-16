@@ -27,7 +27,10 @@ from authz import (
     require_tenant_role,
     resolve_project_role,
 )
+import audit
 import billing
+import quotas
+import rate_limit
 import tenants
 import users
 from users import User
@@ -241,6 +244,14 @@ def tenants_create(body: CreateTenantBody, user: User = Depends(require_platform
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "tenant.create",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=cfg.get("slug"),
+        target=cfg.get("slug"),
+        owner=owner,
+    )
     return cfg
 
 
@@ -258,12 +269,19 @@ def tenants_update(slug: str, body: UpdateTenantBody, _: User = Depends(require_
 
 
 @app.delete("/api/tenants/{slug}")
-def tenants_delete(slug: str, _: User = Depends(require_platform_admin)):
+def tenants_delete(slug: str, user: User = Depends(require_platform_admin)):
     """Destroy a tenant — projects, templates, shared assets, memberships."""
     try:
         tenants.delete_tenant(slug)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="tenant not found")
+    audit.record(
+        "tenant.delete",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=slug,
+    )
     return {"deleted": slug}
 
 
@@ -276,33 +294,58 @@ def members_list(slug: str, _: User = Depends(require_tenant_role("viewer"))):
 
 
 @app.post("/api/tenants/{slug}/members")
-def members_add(slug: str, body: AddMemberBody, _: User = Depends(require_tenant_role("owner"))):
+def members_add(slug: str, body: AddMemberBody, user: User = Depends(require_tenant_role("owner"))):
     try:
-        return tenants.add_member(slug, body.user, body.role)
+        out = tenants.add_member(slug, body.user, body.role)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "member.add",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=out.get("user_id"),
+        role=out.get("role"),
+    )
+    return out
 
 
 @app.patch("/api/tenants/{slug}/members/{user_id}")
-def members_update(slug: str, user_id: str, body: UpdateMemberBody, _: User = Depends(require_tenant_role("owner"))):
+def members_update(slug: str, user_id: str, body: UpdateMemberBody, user: User = Depends(require_tenant_role("owner"))):
     try:
-        return tenants.update_member_role(slug, user_id, body.role)
+        out = tenants.update_member_role(slug, user_id, body.role)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "member.role_change",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=user_id,
+        role=out.get("role"),
+    )
+    return out
 
 
 @app.delete("/api/tenants/{slug}/members/{user_id}")
-def members_remove(slug: str, user_id: str, _: User = Depends(require_tenant_role("owner"))):
+def members_remove(slug: str, user_id: str, user: User = Depends(require_tenant_role("owner"))):
     try:
         tenants.remove_member(slug, user_id)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "member.remove",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=user_id,
+    )
     return {"removed": user_id}
 
 
@@ -322,10 +365,10 @@ def design_system_get(slug: str, _: User = Depends(require_tenant_role("viewer")
 def design_system_put(
     slug: str,
     body: DesignSystemBody,
-    _: User = Depends(require_tenant_role("owner")),
+    user: User = Depends(require_tenant_role("owner")),
 ):
     try:
-        return tenants.write_design_system(
+        out = tenants.write_design_system(
             slug,
             palette=body.palette,
             typography=body.typography,
@@ -335,6 +378,15 @@ def design_system_put(
         raise HTTPException(status_code=404, detail="tenant not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "design_system.update",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target="design_system",
+        slices=[k for k in ("palette", "typography", "spec") if getattr(body, k) is not None],
+    )
+    return out
 
 
 # ─── Shared brand assets (logos, fonts, illustrations) ─────────────────────
@@ -352,7 +404,7 @@ async def shared_upload(
     slug: str,
     file: UploadFile = File(...),
     path: str = Form(...),
-    _: User = Depends(require_tenant_role("editor")),
+    user: User = Depends(require_tenant_role("editor")),
 ):
     """Multipart upload: `path` selects the destination key under shared/.
 
@@ -362,18 +414,31 @@ async def shared_upload(
     """
     body = await file.read()
     try:
-        return tenants.save_shared_asset(slug, path, body)
+        quotas.assert_storage_available(slug, len(body))
+    except HTTPException:
+        raise
+    try:
+        out = tenants.save_shared_asset(slug, path, body)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="tenant not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "shared.upload",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=out.get("path"),
+        size=out.get("size"),
+    )
+    return out
 
 
 @app.delete("/api/tenants/{slug}/shared")
 def shared_delete(
     slug: str,
     path: str,
-    _: User = Depends(require_tenant_role("editor")),
+    user: User = Depends(require_tenant_role("editor")),
 ):
     try:
         tenants.delete_shared_asset(slug, path)
@@ -381,6 +446,13 @@ def shared_delete(
         raise HTTPException(status_code=404, detail=f"not found: {path}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "shared.delete",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=path,
+    )
     return {"deleted": path}
 
 
@@ -564,7 +636,7 @@ def tenant_project_share_add(
     slug: str,
     name: str,
     body: ProjectShareBody,
-    _: User = Depends(require_tenant_role("owner")),
+    user: User = Depends(require_tenant_role("owner")),
 ):
     """Add a share. Body must specify exactly one of ``user_id``, ``email``,
     or ``tenant_slug``. ``role`` is required for user shares (viewer/editor/
@@ -580,6 +652,8 @@ def tenant_project_share_add(
     try:
         if body.tenant_slug:
             meta = tenants.add_project_share_tenant(slug, name, body.tenant_slug)
+            audit_target = f"tenant:{body.tenant_slug}"
+            audit_role = "editor"
         else:
             user_id = body.user_id or ""
             if body.email:
@@ -591,10 +665,21 @@ def tenant_project_share_add(
                 user_id = target.id
             role = body.role or ""
             meta = tenants.add_project_share_user(slug, name, user_id, role)
+            audit_target = f"user:{user_id}"
+            audit_role = role
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "share.add",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=name,
+        principal=audit_target,
+        role=audit_role,
+    )
     return {
         "acl": meta.get("acl", []),
         "shared_with_tenants": meta.get("shared_with_tenants", []),
@@ -606,7 +691,7 @@ def tenant_project_share_remove(
     slug: str,
     name: str,
     principal: str,
-    _: User = Depends(require_tenant_role("owner")),
+    user: User = Depends(require_tenant_role("owner")),
 ):
     """Remove a single grant. ``principal`` is ``user:<id>`` or ``tenant:<slug>``.
     404 when the principal isn't currently listed so the UI can distinguish
@@ -621,10 +706,142 @@ def tenant_project_share_remove(
         raise HTTPException(status_code=404, detail="principal not shared with")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "share.remove",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=name,
+        principal=principal,
+    )
     return {
         "acl": meta.get("acl", []),
         "shared_with_tenants": meta.get("shared_with_tenants", []),
     }
+
+
+# ─── Trash + quotas (Phase 9) ───────────────────────────────────────────────
+# Project DELETE is a soft-delete: the directory moves to ``.trash/`` so an
+# accidental delete is reversible. Trash counts against the storage quota but
+# not the project-slot quota, so a tenant near both caps has to actually purge
+# before they can create new work. Quotas are enforced at every write boundary
+# (project create, from-template, shared upload, output-dir register).
+
+
+@app.delete("/api/tenants/{slug}/projects/{name}")
+def tenant_project_delete(
+    slug: str,
+    name: str,
+    user: User = Depends(require_project_role("owner")),
+):
+    """Soft-delete a project: move it to ``tenants/<slug>/.trash/``.
+
+    Project-level owner role required — viewers/editors can't drop a deck,
+    even on a project they were shared into as editor. Platform admins
+    inherit the right via resolve_project_role.
+    """
+    try:
+        entry = tenants.trash_project(slug, name)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="project not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "project.trash",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=name,
+        trash_id=entry["id"],
+    )
+    return {"trashed": entry}
+
+
+@app.get("/api/tenants/{slug}/trash")
+def tenant_trash_list(slug: str, _: User = Depends(require_tenant_role("editor"))):
+    """List soft-deleted projects. Editors can browse; restore/purge gate on owner."""
+    try:
+        return {"trash": tenants.list_trash(slug)}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="tenant not found")
+
+
+@app.post("/api/tenants/{slug}/trash/{trash_id}/restore")
+def tenant_trash_restore(
+    slug: str,
+    trash_id: str,
+    user: User = Depends(require_tenant_role("owner")),
+):
+    """Move a trash entry back to ``projects/<original>``. 409 on name collision."""
+    try:
+        result = tenants.restore_from_trash(slug, trash_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="trash entry not found")
+    except FileExistsError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=f"a live project named {str(e)!r} already exists; rename or purge first",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "project.restore",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=result["restored_as"],
+        trash_id=trash_id,
+    )
+    return result
+
+
+@app.delete("/api/tenants/{slug}/trash/{trash_id}")
+def tenant_trash_purge(
+    slug: str,
+    trash_id: str,
+    user: User = Depends(require_tenant_role("owner")),
+):
+    """Permanently delete a trash entry. No further recovery."""
+    try:
+        tenants.purge_from_trash(slug, trash_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="trash entry not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "project.purge",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=trash_id,
+    )
+    return {"purged": trash_id}
+
+
+@app.get("/api/tenants/{slug}/quota")
+def tenant_quota_usage(slug: str, _: User = Depends(require_tenant_role("viewer"))):
+    """Snapshot of project count + storage usage vs caps. Cheap enough to call
+    on every dashboard render at the volumes we expect."""
+    if not tenants.tenant_exists(slug):
+        raise HTTPException(status_code=404, detail="tenant not found")
+    return quotas.usage(slug)
+
+
+# ─── Audit log (platform-admin only) ────────────────────────────────────────
+
+
+@app.get("/api/platform/audit")
+def platform_audit_read(
+    tenant: Optional[str] = None,
+    limit: int = 200,
+    _: User = Depends(require_platform_admin),
+):
+    """Newest-first audit events. Filterable by tenant. Platform-admin only."""
+    if limit < 1:
+        limit = 1
+    if limit > 1000:
+        limit = 1000
+    return {"events": audit.read(tenant=tenant, limit=limit)}
 
 
 # ─── Mediated provider routes (Phase 5) ─────────────────────────────────────
@@ -655,6 +872,14 @@ def tenant_generate_image(
     proj_root = project_path(name, slug)
     if not proj_root.exists():
         raise HTTPException(status_code=404, detail="project not found")
+
+    # Phase 9: pre-flight billing / quota / rate-limit guards. Image-gen is
+    # the most expensive single call we mediate — bucket cost ~ $0.10 default.
+    estimate = billing.estimate_cost_usd(body.model, kind="image")
+    billing.check_eligibility(slug, estimate)
+    rate_limit.check_and_consume(slug, estimated_cost_usd=estimate, actor_id=user.id)
+    # Reserve ~8 MB headroom (2K-tier PNG); the actual file is usually smaller.
+    quotas.assert_storage_available(slug, 8 * 1024 * 1024)
 
     try:
         result = generate_image(
@@ -770,6 +995,14 @@ def tenant_billing_caps(
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        audit.record(
+            "billing.cap_change",
+            actor_id=user.id,
+            platform_admin=user.platform_admin,
+            tenant=slug,
+            target="cap_soft_usd",
+            value=result["cap_soft_usd"],
+        )
     if body.cap_hard_usd is not None:
         if not user.platform_admin:
             raise HTTPException(
@@ -782,6 +1015,14 @@ def tenant_billing_caps(
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        audit.record(
+            "billing.cap_change",
+            actor_id=user.id,
+            platform_admin=user.platform_admin,
+            tenant=slug,
+            target="cap_hard_usd",
+            value=result["cap_hard_usd"],
+        )
     return result
 
 
@@ -789,7 +1030,7 @@ def tenant_billing_caps(
 def tenant_billing_payment(
     slug: str,
     body: UpdateBillingPaymentBody,
-    _: User = Depends(require_tenant_role("owner")),
+    user: User = Depends(require_tenant_role("owner")),
 ):
     """Toggle payment_mode and update the billing email."""
     out = {}
@@ -798,8 +1039,24 @@ def tenant_billing_payment(
             out["payment_mode"] = billing.set_payment_mode(slug, body.payment_mode)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        audit.record(
+            "billing.payment_change",
+            actor_id=user.id,
+            platform_admin=user.platform_admin,
+            tenant=slug,
+            target="payment_mode",
+            value=out["payment_mode"],
+        )
     if body.billing_email is not None:
         out["billing_email"] = billing.set_billing_email(slug, body.billing_email)
+        audit.record(
+            "billing.payment_change",
+            actor_id=user.id,
+            platform_admin=user.platform_admin,
+            tenant=slug,
+            target="billing_email",
+            value=out["billing_email"],
+        )
     return out
 
 
@@ -836,7 +1093,7 @@ def tenant_billing_portal(
 
 @app.post("/api/platform/billing/credit")
 def platform_billing_credit(
-    body: PlatformCreditBody, _: User = Depends(require_platform_admin)
+    body: PlatformCreditBody, user: User = Depends(require_platform_admin)
 ):
     """Record a manual credit (wire transfer, adjustment). Idempotent on
     (tenant, reference). The reference doubles as the source_id so the
@@ -857,6 +1114,14 @@ def platform_billing_credit(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "billing.manual_credit",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=body.tenant,
+        target=txn.source_id,
+        amount_usd=str(txn.amount_usd),
+    )
     return {
         "id": txn.id,
         "tenant": txn.tenant,
@@ -865,6 +1130,47 @@ def platform_billing_credit(
         "source_id": txn.source_id,
         "balance_usd": str(billing.balance_usd(body.tenant)),
     }
+
+
+class RunInvoicesBody(BaseModel):
+    period: Optional[str] = None  # YYYYMM; defaults to previous month
+
+
+@app.post("/api/platform/billing/invoices/run")
+def platform_run_monthly_invoices(
+    body: RunInvoicesBody, user: User = Depends(require_platform_admin)
+):
+    """Trigger the monthly auto-invoice job. Idempotent on (tenant, period).
+    Raises 503 when Stripe is not configured — no fabricated invoices."""
+    try:
+        out = billing.run_monthly_invoices(body.period)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "billing.invoices_run",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=None,
+        target=out.get("period"),
+        count=len(out.get("results") or []),
+    )
+    return out
+
+
+@app.get("/api/platform/billing/invoices")
+def platform_list_invoice_runs(
+    tenant: Optional[str] = None,
+    limit: int = 100,
+    _: User = Depends(require_platform_admin),
+):
+    """List invoice cron outcomes; filterable by tenant."""
+    if limit < 1:
+        limit = 1
+    if limit > 1000:
+        limit = 1000
+    return {"runs": billing.list_invoice_runs(tenant=tenant, limit=limit)}
 
 
 @app.post("/api/billing/stripe/webhook")
@@ -956,9 +1262,10 @@ def tenant_template_file(
 def tenant_create_project_from_template(
     slug: str,
     body: CreateProjectFromTemplateBody,
-    _: User = Depends(require_tenant_role("editor")),
+    user: User = Depends(require_tenant_role("editor")),
 ):
     """Materialize a new project under the tenant from one of its templates."""
+    quotas.assert_project_slot_available(slug)
     try:
         project_dir = create_project_from_template(
             body.template, body.project_name, body.format, slug
@@ -967,6 +1274,15 @@ def tenant_create_project_from_template(
         raise HTTPException(status_code=404, detail="template not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    audit.record(
+        "project.create",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=project_dir.name,
+        template=body.template,
+        format=body.format or "",
+    )
     return {
         "tenant": slug,
         "project": project_dir.name,
@@ -1178,9 +1494,12 @@ async def create_session(
     """Legacy: defaults to the ``default`` tenant. Tenant-prefixed callers
     should use ``POST /api/tenants/{slug}/sessions`` instead."""
     _ensure_default_editor(user)
-    billing.check_eligibility(
-        "default", billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
+    estimate = billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
+    billing.check_eligibility("default", estimate)
+    rate_limit.check_and_consume(
+        "default", estimated_cost_usd=estimate, actor_id=user.id
     )
+    quotas.assert_project_slot_available("default")
     try:
         proj = init_project(body.name, body.format, slug="default")
     except RuntimeError as e:
@@ -1206,8 +1525,10 @@ async def attach_session(
 ):
     """Attach a session to an existing project (no init). Legacy default-tenant alias."""
     _ensure_default_editor(user)
-    billing.check_eligibility(
-        "default", billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
+    estimate = billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
+    billing.check_eligibility("default", estimate)
+    rate_limit.check_and_consume(
+        "default", estimated_cost_usd=estimate, actor_id=user.id
     )
     proj = project_path(body.name, slug="default")
     if not proj.exists():
@@ -1233,9 +1554,10 @@ async def create_tenant_session(
 ):
     """Create a session bound to a specific tenant. Caller must be at
     least editor on the tenant — viewers cannot run agent chats."""
-    billing.check_eligibility(
-        slug, billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
-    )
+    estimate = billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
+    billing.check_eligibility(slug, estimate)
+    rate_limit.check_and_consume(slug, estimated_cost_usd=estimate, actor_id=user.id)
+    quotas.assert_project_slot_available(slug)
     try:
         proj = init_project(body.name, body.format, slug=slug)
     except RuntimeError as e:
@@ -1244,6 +1566,15 @@ async def create_tenant_session(
     session.permission_mode = _norm_mode(body.permission_mode)
     tier = _norm_tier(body.model_tier)
     session.model = _TIER_TO_MODEL[tier]
+    audit.record(
+        "project.create",
+        actor_id=user.id,
+        platform_admin=user.platform_admin,
+        tenant=slug,
+        target=proj.name,
+        format=body.format,
+        via="session",
+    )
     return {
         "session_id": session.id,
         "project": proj.name,
@@ -1271,9 +1602,9 @@ async def attach_tenant_session(
     if role is None or role == "viewer":
         # Viewer can browse files but not run the agent — sessions imply writes.
         raise HTTPException(status_code=403, detail="editor role required to attach a session")
-    billing.check_eligibility(
-        slug, billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
-    )
+    estimate = billing.estimate_cost_usd(_TIER_TO_MODEL[_norm_tier(body.model_tier)])
+    billing.check_eligibility(slug, estimate)
+    rate_limit.check_and_consume(slug, estimated_cost_usd=estimate, actor_id=user.id)
     proj = project_path(body.name, slug=slug)
     if not proj.exists():
         raise HTTPException(status_code=404, detail=f"project not found: {body.name}")
@@ -1337,11 +1668,14 @@ async def delete_session(sid: str, user: User = Depends(current_user)):
 @app.post("/api/sessions/{sid}/message")
 async def send_message(sid: str, body: ChatBody, user: User = Depends(current_user)):
     session = _resolve_session_for_user(sid, user)
+    tenant = session.tenant_slug or "default"
+    estimate = billing.estimate_cost_usd(session.model)
     # Per §17.4: re-check eligibility before each new message — an in-flight
     # session may have crossed the hard cap mid-turn.
-    billing.check_eligibility(
-        session.tenant_slug or "default", billing.estimate_cost_usd(session.model)
-    )
+    billing.check_eligibility(tenant, estimate)
+    # Phase 9: per-tenant token-bucket throttle — defends against bursty
+    # clients and runaway cost regardless of in-session eligibility.
+    rate_limit.check_and_consume(tenant, estimated_cost_usd=estimate, actor_id=user.id)
     # Per-session ceiling guard — protects a runaway loop from blowing past
     # tenant-level caps. We compare against the snapshot before this turn.
     sc = billing.session_cost_usd(session.id)

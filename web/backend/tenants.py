@@ -669,6 +669,124 @@ def remove_project_share(slug: str, project_name: str, principal: str) -> dict:
     return meta
 
 
+# ─── Soft delete + trash (Phase 9) ──────────────────────────────────────────
+# Project DELETE moves the directory to ``tenants/<slug>/.trash/<name>__<ts>/``.
+# Trash counts against the storage quota — incentive to purge — but never blocks
+# project-slot quota.
+
+
+_TRASH_DIR_NAME = ".trash"
+
+
+def _trash_root(slug: str) -> Path:
+    return tenant_dir(slug) / _TRASH_DIR_NAME
+
+
+def _safe_trash_id(slug: str, trash_id: str) -> Path:
+    base = _trash_root(slug).resolve()
+    tid = (trash_id or "").strip().lstrip("/")
+    if not tid or "/" in tid or "\\" in tid or tid in {".", ".."} or tid.startswith("."):
+        raise ValueError(f"invalid trash id: {trash_id!r}")
+    target = (base / tid).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        raise ValueError("trash id escape")
+    return target
+
+
+def trash_project(slug: str, project_name: str) -> dict:
+    """Move ``projects/<name>`` to ``.trash/<name>__<ts>/``.
+
+    Returns the trash entry. Raises ``FileNotFoundError`` when the project
+    isn't there to delete. A second delete with the same name lands at a
+    fresh timestamped id, so renames-and-deletes never collide.
+    """
+    if not tenant_exists(slug):
+        raise FileNotFoundError(slug)
+    if not project_name or "/" in project_name or ".." in project_name or project_name.startswith("."):
+        raise ValueError(f"invalid project name: {project_name!r}")
+    src = tenant_dir(slug) / "projects" / project_name
+    if not src.exists() or not src.is_dir():
+        raise FileNotFoundError(project_name)
+    trash_root = _trash_root(slug)
+    trash_root.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time())
+    trash_id = f"{project_name}__{ts}"
+    dst = trash_root / trash_id
+    suffix = 0
+    while dst.exists():
+        suffix += 1
+        dst = trash_root / f"{project_name}__{ts}_{suffix}"
+    shutil.move(str(src), str(dst))
+    return {
+        "id": dst.name,
+        "original_name": project_name,
+        "trashed_at": ts,
+    }
+
+
+def list_trash(slug: str) -> list[dict]:
+    """List trash entries newest-first."""
+    if not tenant_exists(slug):
+        raise FileNotFoundError(slug)
+    root = _trash_root(slug)
+    if not root.exists():
+        return []
+    out: list[dict] = []
+    for p in root.iterdir():
+        if not p.is_dir():
+            continue
+        name = p.name
+        try:
+            base, _, ts_str = name.rpartition("__")
+            ts = int(ts_str.split("_", 1)[0])
+            original = base
+        except Exception:
+            ts = int(p.stat().st_mtime)
+            original = name
+        out.append({
+            "id": name,
+            "original_name": original,
+            "trashed_at": ts,
+        })
+    out.sort(key=lambda e: e["trashed_at"], reverse=True)
+    return out
+
+
+def restore_from_trash(slug: str, trash_id: str) -> dict:
+    """Move ``.trash/<trash_id>/`` back to ``projects/<original_name>``.
+
+    Raises ``FileExistsError`` if a live project already owns the name —
+    caller must rename or purge first. We never silently overwrite.
+    """
+    if not tenant_exists(slug):
+        raise FileNotFoundError(slug)
+    src = _safe_trash_id(slug, trash_id)
+    if not src.exists() or not src.is_dir():
+        raise FileNotFoundError(trash_id)
+    original = trash_id.rpartition("__")[0] or trash_id
+    dst = tenant_dir(slug) / "projects" / original
+    if dst.exists():
+        raise FileExistsError(original)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+    return {
+        "id": trash_id,
+        "restored_as": original,
+    }
+
+
+def purge_from_trash(slug: str, trash_id: str) -> None:
+    """Permanently delete a trash entry. Raises FileNotFoundError if missing."""
+    if not tenant_exists(slug):
+        raise FileNotFoundError(slug)
+    target = _safe_trash_id(slug, trash_id)
+    if not target.exists() or not target.is_dir():
+        raise FileNotFoundError(trash_id)
+    shutil.rmtree(target)
+
+
 def list_for_user(user: User) -> list[dict]:
     """Tenants the user can see, with their role per tenant.
 
