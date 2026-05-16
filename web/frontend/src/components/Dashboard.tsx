@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { TenantSwitcher } from "./TenantSwitcher";
+import { QuotaBadge } from "./QuotaBadge";
 import { AccountBadge } from "./LoginGate";
 import type { Me, TenantSummary } from "../hooks/useTenants";
 
@@ -148,7 +149,7 @@ export function Dashboard({
           </span>
         </div>
 
-        <div className="px-5 pb-3 flex items-center justify-between gap-3">
+        <div className="px-5 pb-2 flex items-center justify-between gap-3">
           {tenantsLoading ? (
             <div className="text-[11px] text-gray-400 italic">Loading workspaces…</div>
           ) : tenantsError ? (
@@ -170,6 +171,12 @@ export function Dashboard({
             />
           )}
         </div>
+
+        {activeSlug && (
+          <div className="px-5 pb-3">
+            <QuotaBadge tenantSlug={activeSlug} refreshKey={existing.length} />
+          </div>
+        )}
 
         <div className="mx-5 mt-2 border border-[#EFE6D6] rounded-lg p-4 bg-white">
           <div className="text-sm font-semibold mb-3">New project</div>

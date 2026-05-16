@@ -20,6 +20,11 @@ export type AgentEvent =
       tenant: string;
       mtd_billed_usd: string;
       cap_hard_usd: string;
+    }
+  | {
+      type: "rate_limited";
+      reason: "req_per_min" | "cost_per_min_usd" | string;
+      retry_after_seconds: number;
     };
 
 export function useAgentStream(sessionId: string) {
@@ -64,6 +69,31 @@ export function useAgentStream(sessionId: string) {
           body: JSON.stringify({ text }),
           signal: ctrl.signal,
         });
+        // 429 from rate_limit.check_and_consume — surface as a typed event
+        // so ChatPanel can render a countdown banner with a useful reason.
+        if (res.status === 429) {
+          let retry = 0;
+          let reason = "rate_limited";
+          try {
+            const body = await res.json();
+            const detail = body?.detail ?? body ?? {};
+            retry = Number(detail.retry_after_seconds) || 0;
+            if (typeof detail.reason === "string") reason = detail.reason;
+          } catch {
+            // Fall back to the Retry-After header — it carries a coarse
+            // second-grained ceiling the backend always sets.
+          }
+          if (!retry) {
+            const hdr = res.headers.get("Retry-After");
+            const parsed = hdr ? Number(hdr) : 0;
+            if (Number.isFinite(parsed) && parsed > 0) retry = parsed;
+          }
+          setEvents((prev) => [
+            ...prev,
+            { type: "rate_limited", reason, retry_after_seconds: retry },
+          ]);
+          return;
+        }
         // 402 from check_eligibility / per-session ceiling — surface as a
         // billing event so the chat banners pick it up instead of a generic error.
         if (res.status === 402) {

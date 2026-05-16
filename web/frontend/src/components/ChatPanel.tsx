@@ -636,6 +636,15 @@ export function ChatPanel({
                 </div>
               );
             }
+            if (b.kind === "rate_limit") {
+              return (
+                <RateLimitBanner
+                  key={i}
+                  reason={b.reason}
+                  retryAfterSeconds={b.retryAfterSeconds}
+                />
+              );
+            }
             return null;
           });
         })()}
@@ -1238,7 +1247,8 @@ type RenderBlock =
     }
   | { kind: "error"; message: string }
   | { kind: "done" }
-  | { kind: "billing"; level: "warn" | "block"; text: string };
+  | { kind: "billing"; level: "warn" | "block"; text: string }
+  | { kind: "rate_limit"; reason: string; retryAfterSeconds: number };
 
 function groupEvents(events: AgentEvent[]): RenderBlock[] {
   const blocks: RenderBlock[] = [];
@@ -1307,6 +1317,12 @@ function groupEvents(events: AgentEvent[]): RenderBlock[] {
         level: "block",
         text: `Billing blocked: MTD $${fmt2(evt.mtd_billed_usd)} reached the $${fmt2(evt.cap_hard_usd)} hard cap. New messages are paused until the cap is raised or credit is added.`,
       });
+    } else if (evt.type === "rate_limited") {
+      blocks.push({
+        kind: "rate_limit",
+        reason: evt.reason,
+        retryAfterSeconds: Number(evt.retry_after_seconds) || 0,
+      });
     }
     // raw events are ignored
   }
@@ -1318,6 +1334,45 @@ function fmt2(s: string | number | undefined) {
   const n = typeof s === "number" ? s : parseFloat(s ?? "0");
   if (!Number.isFinite(n)) return "0.00";
   return n.toFixed(2);
+}
+
+function RateLimitBanner({
+  reason,
+  retryAfterSeconds,
+}: {
+  reason: string;
+  retryAfterSeconds: number;
+}) {
+  // Tick a local countdown rather than sleeping the message bar — the user can
+  // still scroll, send other clicks, etc. while waiting. We freeze at 0 once
+  // the bucket has notionally refilled; the next /message attempt will either
+  // pass or render a fresh banner with a fresh deadline.
+  const [remaining, setRemaining] = useState(() =>
+    Math.max(0, Math.ceil(retryAfterSeconds)),
+  );
+  useEffect(() => {
+    if (remaining <= 0) return;
+    const id = window.setInterval(() => {
+      setRemaining((s) => (s <= 1 ? 0 : s - 1));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [remaining]);
+  const label =
+    reason === "cost_per_min_usd"
+      ? "Cost rate limit"
+      : reason === "req_per_min"
+      ? "Request rate limit"
+      : "Rate limited";
+  return (
+    <div className="rounded-md border border-amber-300 bg-amber-50 text-amber-800 text-xs px-3 py-2">
+      <span className="font-medium mr-1">{label}.</span>
+      {remaining > 0 ? (
+        <>Try again in <span className="font-mono">{remaining}s</span>.</>
+      ) : (
+        <>The cap has refilled — send the next message to retry.</>
+      )}
+    </div>
+  );
 }
 
 function modelShort(m: string) {

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-type Tab = "members" | "design" | "shared";
+type Tab = "members" | "design" | "shared" | "trash";
 
 type Member = { user_id: string; role: "viewer" | "editor" | "owner" };
 type DesignSystem = {
@@ -13,6 +13,11 @@ type SharedAsset = {
   size: number;
   mtime: number;
   kind: string;
+};
+type TrashEntry = {
+  id: string;
+  original_name: string;
+  trashed_at: number;
 };
 
 /**
@@ -69,7 +74,7 @@ export function TenantSettingsDrawer({
         </div>
 
         <div className="px-6 pt-3 flex items-center gap-1 border-b border-gray-100">
-          {(["members", "design", "shared"] as Tab[]).map((t) => (
+          {(["members", "design", "shared", "trash"] as Tab[]).map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -82,6 +87,7 @@ export function TenantSettingsDrawer({
               {t === "members" && "Members"}
               {t === "design" && "Design system"}
               {t === "shared" && "Shared assets"}
+              {t === "trash" && "Trash"}
             </button>
           ))}
         </div>
@@ -95,6 +101,9 @@ export function TenantSettingsDrawer({
           )}
           {tab === "shared" && (
             <SharedTab tenantSlug={tenantSlug} canEdit={isOwner} />
+          )}
+          {tab === "trash" && (
+            <TrashTab tenantSlug={tenantSlug} canMutate={isOwner} />
           )}
         </div>
       </div>
@@ -657,4 +666,196 @@ function humanSize(n: number) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// ─── Trash ──────────────────────────────────────────────────────────────────
+
+function TrashTab({
+  tenantSlug,
+  canMutate,
+}: {
+  tenantSlug: string;
+  canMutate: boolean;
+}) {
+  // Backend gates listing at editor; restore/purge at owner. We surface a
+  // forbidden state if the viewer somehow lands here — TenantSettingsDrawer
+  // already shows a read-only chip for non-owners, so this is belt-and-braces.
+  const [entries, setEntries] = useState<TrashEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [forbidden, setForbidden] = useState(false);
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`/api/tenants/${tenantSlug}/trash`);
+      if (res.status === 403) {
+        setForbidden(true);
+        setEntries([]);
+        setError(null);
+        return;
+      }
+      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+      const d = await res.json();
+      setEntries(d.trash ?? []);
+      setForbidden(false);
+      setError(null);
+    } catch (e: any) {
+      setError(String(e.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }, [tenantSlug]);
+
+  useEffect(() => {
+    reload();
+  }, [reload]);
+
+  async function restore(id: string) {
+    setBusyId(id);
+    setError(null);
+    try {
+      const res = await fetch(
+        `/api/tenants/${tenantSlug}/trash/${encodeURIComponent(id)}/restore`,
+        { method: "POST" },
+      );
+      if (!res.ok) {
+        const body = await res.text();
+        // Collision (409) carries a specific message — surface verbatim so
+        // the owner knows to rename or purge first.
+        throw new Error(body || res.statusText);
+      }
+      await reload();
+    } catch (e: any) {
+      setError(String(e.message || e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function purge(entry: TrashEntry) {
+    if (
+      !confirm(
+        `Permanently delete "${entry.original_name}"? This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    setBusyId(entry.id);
+    setError(null);
+    try {
+      const res = await fetch(
+        `/api/tenants/${tenantSlug}/trash/${encodeURIComponent(entry.id)}`,
+        { method: "DELETE" },
+      );
+      if (!res.ok) throw new Error(await res.text());
+      await reload();
+    } catch (e: any) {
+      setError(String(e.message || e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  if (forbidden) {
+    return (
+      <div className="text-[12px] text-amber-700 bg-amber-50 border border-amber-200 rounded p-3">
+        Trash is visible to editors and owners. Ask a workspace owner to
+        promote your role if you need access.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="text-[12px] text-gray-500 leading-relaxed">
+        Deleted projects sit here until purged. Trash counts toward the
+        tenant's storage quota. Restoring uses the original project name —
+        rename first if a live project already owns it.
+      </div>
+
+      {error && <div className="text-[12px] text-red-600">{error}</div>}
+
+      <div className="border border-[#EFE6D6] rounded-lg overflow-hidden">
+        <table className="w-full text-[13px]">
+          <thead className="bg-[#FBF7F1] text-[11px] uppercase tracking-wider text-gray-500">
+            <tr>
+              <th className="text-left px-3 py-2">Project</th>
+              <th className="text-left px-3 py-2">Deleted</th>
+              {canMutate && <th className="px-3 py-2 w-40 text-right">Actions</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {loading && (
+              <tr>
+                <td
+                  colSpan={canMutate ? 3 : 2}
+                  className="px-3 py-4 text-center text-gray-400"
+                >
+                  Loading…
+                </td>
+              </tr>
+            )}
+            {!loading && entries.length === 0 && (
+              <tr>
+                <td
+                  colSpan={canMutate ? 3 : 2}
+                  className="px-3 py-4 text-center text-gray-400 italic"
+                >
+                  Trash is empty.
+                </td>
+              </tr>
+            )}
+            {entries.map((e) => (
+              <tr key={e.id} className="border-t border-gray-100 align-top">
+                <td className="px-3 py-2">
+                  <div className="font-medium text-gray-800">
+                    {e.original_name}
+                  </div>
+                  <div className="font-mono text-[11px] text-gray-400 truncate" title={e.id}>
+                    {e.id}
+                  </div>
+                </td>
+                <td className="px-3 py-2 text-[12px] text-gray-500">
+                  {relTimeFromUnix(e.trashed_at)}
+                </td>
+                {canMutate && (
+                  <td className="px-3 py-2 text-right space-x-1.5">
+                    <button
+                      onClick={() => restore(e.id)}
+                      disabled={busyId === e.id}
+                      className="text-[12px] px-2 py-1 rounded border border-gray-200 text-gray-700 hover:bg-[#FBF7F1] disabled:opacity-60"
+                    >
+                      Restore
+                    </button>
+                    <button
+                      onClick={() => purge(e)}
+                      disabled={busyId === e.id}
+                      className="text-[12px] px-2 py-1 rounded border border-red-200 text-red-600 hover:bg-red-50 disabled:opacity-60"
+                      title="Permanently delete"
+                    >
+                      Purge
+                    </button>
+                  </td>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function relTimeFromUnix(ts: number) {
+  if (!ts) return "—";
+  const now = Date.now() / 1000;
+  const delta = now - ts;
+  if (delta < 60) return "just now";
+  if (delta < 3600) return `${Math.floor(delta / 60)} min ago`;
+  if (delta < 86400) return `${Math.floor(delta / 3600)} h ago`;
+  const days = Math.floor(delta / 86400);
+  if (days < 30) return `${days} d ago`;
+  return new Date(ts * 1000).toLocaleDateString();
 }
