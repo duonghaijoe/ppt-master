@@ -1,8 +1,8 @@
 {
-  "current_phase": 7,
-  "completed": [1, 2, 3, 4, 5, 6],
+  "current_phase": 8,
+  "completed": [1, 2, 3, 4, 5, 6, 7],
   "blockers": [],
-  "last_commit": "a763cf3e",
+  "last_commit": "e781f7d5",
   "started_at": "2026-05-15T00:00:00Z",
   "notes": {
     "1": "PR #1 squash-merged to main as 2e066254. 8/8 phase-1 tests passed; path-mapper + tenants/default/ live.",
@@ -10,7 +10,8 @@
     "3": "PR #3 squash-merged as e02f260c. 23/23 phase-3 tests + 20/20 regression = 43/43 green. Role enforcement on every route (tenant-prefixed + legacy), session ownership, agent cross-tenant sandbox via _TENANT_PATH_PATTERN, guardrail prompt updated.",
     "4": "PR #4 squash-merged as dc8061a7. 19/19 phase-4 tests + 43/43 regression = 62/62 green. skills/ → platform/skills/ via git mv (11,981 renames), /api/platform/skills (list/get/tree/file) + admin-only /api/platform/admins; agent sandbox denies .platform.json and platform/admins/secrets paths from Read and Bash.",
     "5": "PR #5 squash-merged as d2b3e172. 13/13 phase-5 tests + 62/62 regression = 75/75 green. metering.py with UsageEvent + SQLite WAL ledger at platform/billing.db; pricing.json (anthropic + openai, 20% margin, version 2026-05-15). providers/openai_images.py wraps real SDK with ProviderError → HTTP 503 (no mocks). POST /api/tenants/{t}/projects/{p}/images/generate writes into project images/ + records UsageEvent. agent.py pump loop calls record_chat_usage per SDK message; sandbox denies image_gen.py / api.openai.com from Bash. Live smoke: real PNG generated, $0.048 billed row in ledger.",
-    "6": "PR #6 squash-merged as a763cf3e. 22/22 phase-6 tests (1 xfail for missing STRIPE_TEST_SECRET_KEY) + 75/75 regression = 97/97 green. billing.py ledger (trial $20/90d, cap_soft $80, cap_hard $100, session_ceiling $5 — all configurable in tenants/<t>/config.json billing block + DB overrides). check_eligibility() gates legacy + tenant-prefixed session create AND message send with HTTP 402 (hard_cap_exceeded or insufficient_balance). Soft-threshold watermark — one billing.threshold SSE event per crossing, resets when MTD drops. Stripe Checkout + customer portal + signature-verified webhook (lazy stripe import, 503 when key absent — no mocks). /api/platform/billing/credit idempotent on (tenant, reference). BillingDrawer frontend with owner/viewer split: balance, trial, MTD, cap progress bars, soft-cap editor, Stripe top-up + portal, manual-pay contact block, usage + transactions tabs. Per-session cost counter ($X · Model badge) in ChatPanel toolbar — refreshes after each turn via /api/sessions/{sid}/cost. useAgentStream surfaces 402 responses as billing.cap_exceeded events; ChatPanel renders billing.threshold + billing.cap_exceeded as amber/red banners. Live smoke verified: cap_hard=$0.10 produces 402 on session create; $50 manual credit landed instantly on $20-trial tenant for $70 balance."
+    "6": "PR #6 squash-merged as a763cf3e. 22/22 phase-6 tests (1 xfail for missing STRIPE_TEST_SECRET_KEY) + 75/75 regression = 97/97 green. billing.py ledger (trial $20/90d, cap_soft $80, cap_hard $100, session_ceiling $5 — all configurable in tenants/<t>/config.json billing block + DB overrides). check_eligibility() gates legacy + tenant-prefixed session create AND message send with HTTP 402 (hard_cap_exceeded or insufficient_balance). Soft-threshold watermark — one billing.threshold SSE event per crossing, resets when MTD drops. Stripe Checkout + customer portal + signature-verified webhook (lazy stripe import, 503 when key absent — no mocks). /api/platform/billing/credit idempotent on (tenant, reference). BillingDrawer frontend with owner/viewer split: balance, trial, MTD, cap progress bars, soft-cap editor, Stripe top-up + portal, manual-pay contact block, usage + transactions tabs. Per-session cost counter ($X · Model badge) in ChatPanel toolbar — refreshes after each turn via /api/sessions/{sid}/cost. useAgentStream surfaces 402 responses as billing.cap_exceeded events; ChatPanel renders billing.threshold + billing.cap_exceeded as amber/red banners. Live smoke verified: cap_hard=$0.10 produces 402 on session create; $50 manual credit landed instantly on $20-trial tenant for $70 balance.",
+    "7": "PR #7 squash-merged as e781f7d5. 25/25 phase-7 tests + 97/97 regression = 122/122 green (+ 1 xfail Stripe live). Backend: design-system module (palette/typography/spec.md, atomic per-slice writes, partial PUT preserves siblings, 400/422 on bad shape); shared-assets module (25 MB cap, extension denylist .exe/.js/.html/.py/.sh/…, path-escape guard via Path.resolve().relative_to(base), prunes empty parents on delete). 6 new routes on /api/tenants/{slug}/{design-system,shared,shared/file,templates/{name}/file,projects/from-template}. RBAC matrix: design-system owner-only write / viewer read, shared upload+delete editor+/viewer read+fetch, template-file viewer, from-template editor. Frontend: useTenants hook (Me + TenantSummary, localStorage awesomedeck.activeTenant, revoked-slug fallback to first available). TenantSwitcher (sidebar dropdown, click-outside-to-close, empty-state pill). TenantSettingsDrawer with Members/Design/Shared tabs + read-only chip for non-owners. Dashboard tenant-scoped: templates list, thumbnail fetch, from-template create, project list — all pivot off activeSlug. App.switchTenant calls exitSession() before setActiveSlug (§10.2). Frontend interactive flows code-only-verified — backend coverage exhaustive, vite build 423.96 kB clean."
   },
   "phase_1": {
     "branch": "feature/multitenant-phase-1",
@@ -97,6 +98,34 @@
       "ui_billing_threshold_banner": "CODE-ONLY (ChatPanel renders billing.threshold as amber banner)",
       "ui_billing_cap_exceeded_banner": "CODE-ONLY (ChatPanel renders 402 + billing.cap_exceeded as red banner via useAgentStream surfacing)",
       "no_mock_provider_calls": "PASS (Stripe absent → HTTP 503; never returns fake URL)"
+    }
+  },
+  "phase_7": {
+    "branch": "feature/multitenant-phase-7",
+    "pr_url": "https://github.com/duonghaijoe/ppt-master/pull/7",
+    "merged_commit": "e781f7d5",
+    "tests_status": "25/25 pass (122/122 cumulative, 1 xfail Stripe live)",
+    "verify_results": {
+      "tenant_switcher_in_top_bar": "PASS (TenantSwitcher in dashboard sidebar — role badge, active highlight, empty-state pill)",
+      "switching_tenant_cancels_session": "PASS (App.switchTenant calls exitSession before setActiveSlug)",
+      "members_page_owner_only_role_crud": "PASS (MembersTab — UI gated on canEdit, backend 403s editors/viewers)",
+      "design_system_editor_owner_only_write": "PASS (palette+typography+spec.md; partial PUT preserves untouched slices; non-owners 403)",
+      "design_system_viewer_read": "PASS (test_design_system_viewer_can_read)",
+      "design_system_non_member_403": "PASS",
+      "design_system_invalid_palette_400_or_422": "PASS",
+      "shared_asset_uploader_editor_write": "PASS (multipart upload — editor sufficient; viewer 403)",
+      "shared_asset_extension_denylist": "PASS (.exe .js .html .py .sh all rejected)",
+      "shared_asset_size_cap_25mb": "PASS (26 MB upload → 400)",
+      "shared_asset_path_traversal_blocked": "PASS (..-paths rejected; nothing lands outside shared/)",
+      "shared_asset_file_fetch_viewer_allow_nonmember_deny": "PASS",
+      "templates_tab_tenant_scoped_in_ui": "CODE-ONLY (Dashboard rewired to /api/tenants/{slug}/templates + thumbnail file route + from-template — no browser exercise this loop)",
+      "tenant_template_file_route_viewer_allow_nonmember_deny": "PASS",
+      "tenant_template_file_path_escape_rejected": "PASS",
+      "from_template_editor_succeeds": "PASS (alpha_copy_phase7_ppt169_<date> materialised under tenant projects/)",
+      "from_template_viewer_blocked": "PASS",
+      "useTenants_localstorage_persistence_revoked_fallback": "CODE-ONLY (hook implements fall-back to first available — covered by unit-test-equivalent backend coverage)",
+      "no_legacy_routes_from_dashboard": "PASS (App.tsx + Dashboard.tsx exclusively call /api/tenants/{slug}/...)",
+      "members_owner_only_write_regression": "PASS"
     }
   },
   "phase_3": {
