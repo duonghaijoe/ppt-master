@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ClockIcon, DeckIcon, PlusIcon } from "./Dashboard";
+import { ShareDialog } from "./ShareDialog";
 
 export type ThreadEntry = {
   id: string;
@@ -14,6 +15,8 @@ type PermissionMode = "auto" | "confirm";
 
 export function ProjectHeader({
   project,
+  tenantSlug,
+  canManageShares,
   threads,
   activeThreadId,
   onSwitchProject,
@@ -22,6 +25,8 @@ export function ProjectHeader({
   onOpenBilling,
 }: {
   project: string;
+  tenantSlug: string | null;
+  canManageShares: boolean;
   threads: ThreadEntry[];
   activeThreadId: string | null;
   permissionMode?: PermissionMode;
@@ -31,6 +36,7 @@ export function ProjectHeader({
   onPermissionChange?: (m: PermissionMode) => void;
   onOpenBilling?: () => void;
 }) {
+  const [shareOpen, setShareOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
 
@@ -102,6 +108,16 @@ export function ProjectHeader({
         )}
       </div>
 
+      {tenantSlug && (
+        <button
+          onClick={() => setShareOpen(true)}
+          title={canManageShares ? "Share this project" : "View who has access"}
+          className="w-8 h-8 rounded-full flex items-center justify-center text-gray-500 hover:bg-gray-100 shrink-0"
+        >
+          <ShareIcon className="w-4 h-4" />
+        </button>
+      )}
+
       {onOpenBilling && (
         <button
           onClick={onOpenBilling}
@@ -119,7 +135,36 @@ export function ProjectHeader({
       >
         <PlusIcon className="w-4 h-4" />
       </button>
+
+      {shareOpen && tenantSlug && (
+        <ShareDialog
+          tenantSlug={tenantSlug}
+          project={project}
+          canManage={canManageShares}
+          onClose={() => setShareOpen(false)}
+        />
+      )}
     </header>
+  );
+}
+
+function ShareIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+    >
+      <circle cx="18" cy="5" r="3" />
+      <circle cx="6" cy="12" r="3" />
+      <circle cx="18" cy="19" r="3" />
+      <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
+      <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
+    </svg>
   );
 }
 

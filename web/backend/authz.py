@@ -19,9 +19,7 @@ by share-aware endpoints; today only the tenant-role layer is wired in.
 """
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
 
 from fastapi import Depends, Header, HTTPException, Request
 
@@ -155,23 +153,16 @@ def resolve_project_role(
     5. None.
 
     Returns one of {"viewer", "editor", "owner"} or None when no rule
-    grants access. Used by share-aware project endpoints; the basic
-    tenant-role check above covers the common case.
+    grants access.
     """
-    from files import REPO_ROOT  # local import to avoid cycle at module load
-
     if user.platform_admin:
         return "owner"
     home_role = _user_role_at(user, tenant_slug)
     if home_role:
         return home_role
-    project_root = REPO_ROOT / "tenants" / tenant_slug / "projects" / project_name
-    meta_path = project_root / ".project.json"
-    if not meta_path.exists():
-        return None
     try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
+        meta = tenants.read_project_meta(tenant_slug, project_name)
+    except (FileNotFoundError, ValueError):
         return None
     for entry in meta.get("acl") or []:
         if entry.get("user_id") == user.id:
@@ -183,3 +174,42 @@ def resolve_project_role(
         if m.tenant_slug in shared:
             return "editor" if m.role == "owner" else m.role
     return None
+
+
+def require_project_role(min_role: str):
+    """Build a FastAPI dependency for project-scoped routes that honors ACL.
+
+    Reads ``slug`` and ``name`` from path params, runs ``resolve_project_role``,
+    and 403s callers without sufficient role. The resolved role is stashed
+    on ``request.state.project_role`` so handlers can branch on it (e.g.,
+    "owner+ can manage shares") without re-resolving.
+
+    Tenant existence still 404s — preferred over 403 for the same reason as
+    ``require_tenant_role``: enumeration is annoying but slug existence is
+    not the secret being guarded.
+    """
+    if min_role not in _ROLE_RANK:
+        raise ValueError(f"unknown role: {min_role!r}")
+    required = _ROLE_RANK[min_role]
+
+    def _dep(request: Request, user: users.User = Depends(current_user)) -> users.User:
+        slug = request.path_params.get("slug") or request.path_params.get("tenant")
+        name = request.path_params.get("name") or request.path_params.get("project")
+        if not slug or not name:
+            raise HTTPException(status_code=500, detail="route missing {slug}/{name} path params")
+        cfg = tenants.read_tenant_config(slug)
+        if cfg is None:
+            raise HTTPException(status_code=404, detail="tenant not found")
+        request.state.tenant = cfg
+        role = resolve_project_role(user, slug, name)
+        if role is None:
+            raise HTTPException(status_code=403, detail="no access to this project")
+        if _ROLE_RANK[role] < required:
+            raise HTTPException(
+                status_code=403,
+                detail=f"requires {min_role}; you are {role}",
+            )
+        request.state.project_role = role
+        return user
+
+    return _dep
