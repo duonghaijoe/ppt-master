@@ -120,7 +120,7 @@ stays empty.
 Run exactly one Bash call:
 
 ```
-curl -sS -X POST http://127.0.0.1:8787/api/templates \
+curl -sS -X POST http://127.0.0.1:8765/api/templates \
   -H 'Content-Type: application/json' \
   -d '{"source_project": "...", "name": "...", "description": "...", "include_images": [...]}'
 ```
@@ -166,7 +166,7 @@ make the API call. The snapshot is only as good as the source.
 To produce a new image into the active project, use exactly one Bash call:
 
 ```
-curl -sS -X POST http://127.0.0.1:8787/api/tenants/<tenant>/projects/<project>/images/generate \
+curl -sS -X POST http://127.0.0.1:8765/api/tenants/<tenant>/projects/<project>/images/generate \
   -H 'Content-Type: application/json' \
   -d '{"prompt": "...", "aspect_ratio": "16:9", "size": "1024"}'
 ```
@@ -490,13 +490,13 @@ class Session:
                     return (
                         "do not write to platform/skills/ppt-master/templates/ — that's the "
                         "skill's own layout library, not the user-template store. "
-                        "Use POST http://127.0.0.1:8787/api/tenants/<t>/templates instead."
+                        "Use POST http://127.0.0.1:8765/api/tenants/<t>/templates instead."
                     )
             for pat in _REPO_TEMPLATES_WRITE_PATTERNS:
                 if pat.search(cmd):
                     return (
                         "do not write to templates/ directly — use the API: "
-                        "POST http://127.0.0.1:8787/api/tenants/<t>/templates "
+                        "POST http://127.0.0.1:8765/api/tenants/<t>/templates "
                         "{source_project, name, description, include_images}"
                     )
             # Bash cross-tenant guard: deny any mention of another tenant's

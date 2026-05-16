@@ -7,8 +7,10 @@ import {
   useRef,
   useState,
 } from "react";
+import { projectApi } from "../api/projectUrls";
 
 type Props = {
+  tenant: string;
   project: string;
   // Project-relative slide path, e.g. `svg_output/01.svg` or
   // `flashcards/templates/A_clean_front.svg`. We use it for both GET (via
@@ -170,8 +172,8 @@ function buildPropChanges(el: SVGElement, k: PropKey, val: string): Change[] {
   return out;
 }
 
-function rewriteImageRefs(svgText: string, project: string): string {
-  const base = `/api/projects/${encodeURIComponent(project)}/images/`;
+function rewriteImageRefs(svgText: string, apiBase: string): string {
+  const base = `${apiBase}/images/`;
   return svgText.replace(
     /(href|xlink:href)\s*=\s*"([^"]+)"/g,
     (m, attr, val) => {
@@ -207,6 +209,7 @@ type TextEdit = {
 
 export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEditor(
   {
+    tenant,
     project,
     path,
     cacheKey,
@@ -220,13 +223,14 @@ export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEd
   },
   ref,
 ) {
+  const apiBase = useMemo(() => projectApi(tenant, project), [tenant, project]);
   // `file` (basename) is kept around for chat-context strings — agents are
   // happier referencing "01.svg" than "svg_output/01.svg" when both sides
   // already know the dir.
   const file = useMemo(() => path.split("/").pop() ?? path, [path]);
   const url = useMemo(
-    () => `/api/projects/${encodeURIComponent(project)}/file?path=${encodeURIComponent(path)}&v=${cacheKey}`,
-    [project, path, cacheKey],
+    () => `${apiBase}/file?path=${encodeURIComponent(path)}&v=${cacheKey}`,
+    [apiBase, path, cacheKey],
   );
   const hostRef = useRef<HTMLDivElement>(null);          // div that *contains* the inline svg
   const [svgOpen, setSvgOpen] = useState<string>("");
@@ -320,7 +324,7 @@ export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEd
     fetch(url)
       .then((r) => (r.ok ? r.text() : Promise.reject(r.statusText)))
       .then((t) => {
-        const fixed = rewriteImageRefs(t, project);
+        const fixed = rewriteImageRefs(t, apiBase);
         const parts = extractInnerSvg(fixed);
         if (!parts) {
           setLoadErr("not an SVG document");
@@ -330,7 +334,7 @@ export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEd
         setSvgInner(parts.inner);
       })
       .catch((e) => setLoadErr(String(e)));
-  }, [url, project]);
+  }, [url, apiBase]);
 
   // Wire selection / dblclick handlers when in edit mode.
   useEffect(() => {
@@ -471,7 +475,7 @@ export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEd
     setSaveErr(null);
     try {
       const res = await fetch(
-        `/api/projects/${encodeURIComponent(project)}/svg-save?path=${encodeURIComponent(path)}`,
+        `${apiBase}/svg-save?path=${encodeURIComponent(path)}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -498,7 +502,7 @@ export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEd
     fetch(url, { cache: "no-store" })
       .then((r) => (r.ok ? r.text() : Promise.reject(r.statusText)))
       .then((t) => {
-        const fixed = rewriteImageRefs(t, project);
+        const fixed = rewriteImageRefs(t, apiBase);
         const parts = extractInnerSvg(fixed);
         if (parts) {
           setSvgOpen(parts.open);
@@ -513,7 +517,7 @@ export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEd
       .catch((e) => setLoadErr(String(e)));
   }
 
-  useImperativeHandle(ref, () => ({ save, revert, undo, redo }), [path, project, svgInner, url]);
+  useImperativeHandle(ref, () => ({ save, revert, undo, redo }), [path, apiBase, svgInner, url]);
 
   // ⌘/Ctrl + S to save, ⌘/Ctrl + Z / ⇧⌘Z (or ⌘Y) for undo/redo while editing.
   useEffect(() => {
@@ -536,7 +540,7 @@ export const SlideEditor = forwardRef<SlideEditorHandle, Props>(function SlideEd
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [editing, path, project, svgInner]);
+  }, [editing, path, apiBase, svgInner]);
 
   // Focus the overlay input as soon as a text edit starts.
   const overlayInputRef = useRef<HTMLTextAreaElement>(null);

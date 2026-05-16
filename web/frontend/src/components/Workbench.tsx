@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Layers } from "lucide-react";
 import { SlideDeck } from "./SlideDeck";
+import { projectApi } from "../api/projectUrls";
 
 type SlideMeta = { name: string; file: string; path: string; mtime: number };
 type DirEntry = {
@@ -21,14 +22,17 @@ function fmtAge(t: number): string {
 }
 
 export function Workbench({
+  tenant,
   project,
   onAskAi,
   onSendAi,
 }: {
+  tenant: string;
   project: string;
   onAskAi?: (text: string) => void;
   onSendAi?: (text: string) => void;
 }) {
+  const apiBase = projectApi(tenant, project);
   // Backend-driven directive: which dirs the agent has registered as decks
   // it's producing, plus the current pick. The UI never shows the raw `dir`
   // path — always the friendly `label`. Individual file browsing lives in
@@ -45,7 +49,7 @@ export function Workbench({
   useEffect(() => {
     let cancelled = false;
     function load() {
-      fetch(`/api/projects/${encodeURIComponent(project)}/output-dirs`)
+      fetch(`${apiBase}/output-dirs`)
         .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
         .then((od) => {
           if (cancelled) return;
@@ -60,7 +64,7 @@ export function Workbench({
     }
     load();
 
-    const es = new EventSource(`/api/projects/${encodeURIComponent(project)}/events`);
+    const es = new EventSource(`${apiBase}/events`);
     let pending: number | null = null;
     es.onmessage = () => {
       if (pending) return;
@@ -74,7 +78,7 @@ export function Workbench({
       es.close();
       if (pending) window.clearTimeout(pending);
     };
-  }, [project]);
+  }, [apiBase]);
 
   // Reset selection when switching projects.
   useEffect(() => {
@@ -120,7 +124,7 @@ export function Workbench({
     if (!dir || dir === backendCurrent) return;
     try {
       const res = await fetch(
-        `/api/projects/${encodeURIComponent(project)}/output-dirs/current`,
+        `${apiBase}/output-dirs/current`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -244,6 +248,7 @@ export function Workbench({
         {active ? (
           <SlideDeck
             key={active.dir}
+            tenant={tenant}
             project={project}
             dir={active.dir}
             label={active.label}

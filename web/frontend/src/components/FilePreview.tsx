@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Presentation } from "lucide-react";
+import { projectApi } from "../api/projectUrls";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"]);
 const SVG_EXT = new Set(["svg"]);
@@ -21,12 +22,14 @@ export function ext(name: string): string {
 }
 
 export function FilePreview({
+  tenant,
   project,
   path,
   version,
   onAskAi,
   compact,
 }: {
+  tenant: string;
   project: string;
   path: string;
   version: number;
@@ -36,12 +39,13 @@ export function FilePreview({
   // so we don't repeat the same path twice on screen.
   compact?: boolean;
 }) {
+  const apiBase = projectApi(tenant, project);
   const e = ext(path);
-  const url = `/api/projects/${encodeURIComponent(project)}/file?path=${encodeURIComponent(path)}&v=${version}`;
+  const url = `${apiBase}/file?path=${encodeURIComponent(path)}&v=${version}`;
   // Path-style URL for the iframe: relative refs inside HTML (./image.png,
   // ./styles.css) resolve to siblings under the same project root instead of
   // failing against the query-string-based /file endpoint.
-  const webUrl = `/api/projects/${encodeURIComponent(project)}/web/${path
+  const webUrl = `${apiBase}/web/${path
     .split("/")
     .map(encodeURIComponent)
     .join("/")}?v=${version}`;

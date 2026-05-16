@@ -2,16 +2,19 @@ import { useEffect, useRef, useState } from "react";
 import { useSlideWatcher } from "../hooks/useSlideWatcher";
 import { useSession } from "../SessionContext";
 import { SlideEditor, type SlideEditorHandle } from "./SlideEditor";
+import { projectApi } from "../api/projectUrls";
 
 type ExportMeta = { file: string; mtime: number; bytes: number };
 
 export function SlideDeck({
+  tenant,
   project,
   dir,
   label,
   onAskAi,
   onSendAi,
 }: {
+  tenant: string;
   project: string;
   // Project-relative working dir (e.g. `svg_output`, `flashcards/templates`).
   dir: string;
@@ -24,7 +27,8 @@ export function SlideDeck({
   // progress while the .pptx is rendered.
   onSendAi?: (text: string) => void;
 }) {
-  const { slides, version } = useSlideWatcher(project, dir);
+  const apiBase = projectApi(tenant, project);
+  const { slides, version } = useSlideWatcher(tenant, project, dir);
   const { streaming } = useSession();
 
   // Latest export, if any. Polled on mount and refreshed on every (debounced)
@@ -39,7 +43,7 @@ export function SlideDeck({
   useEffect(() => {
     let cancelled = false;
     function load() {
-      fetch(`/api/projects/${encodeURIComponent(project)}/exports`)
+      fetch(`${apiBase}/exports`)
         .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
         .then((data) => {
           if (cancelled) return;
@@ -51,7 +55,7 @@ export function SlideDeck({
         });
     }
     load();
-    const es = new EventSource(`/api/projects/${encodeURIComponent(project)}/events`);
+    const es = new EventSource(`${apiBase}/events`);
     let pending: number | null = null;
     es.onmessage = () => {
       if (pending) return;
@@ -65,7 +69,7 @@ export function SlideDeck({
       es.close();
       if (pending) window.clearTimeout(pending);
     };
-  }, [project]);
+  }, [apiBase]);
 
   // Clear the "exporting" marker once a newer .pptx lands. We compare mtime
   // (seconds, server-side) against the click timestamp (ms, client-side) so
@@ -158,7 +162,7 @@ export function SlideDeck({
   const current = slides[safeIndex];
   const cacheKey = `${version}-${current.mtime}`;
   const thumbUrl = (p: string, mtime: number) =>
-    `/api/projects/${encodeURIComponent(project)}/file?path=${encodeURIComponent(p)}&v=${version}-${mtime}`;
+    `${apiBase}/file?path=${encodeURIComponent(p)}&v=${version}-${mtime}`;
 
   return (
     <div className="h-full flex flex-col">
@@ -229,7 +233,7 @@ export function SlideDeck({
             </>
           )}
           <ExportButton
-            project={project}
+            apiBase={apiBase}
             latestExport={latestExport}
             exporting={exportTriggeredAt != null}
             canTrigger={!!onSendAi && !streaming}
@@ -241,6 +245,7 @@ export function SlideDeck({
         <SlideEditor
           ref={editorRef}
           key={current.path}
+          tenant={tenant}
           project={project}
           path={current.path}
           cacheKey={cacheKey}
@@ -293,13 +298,13 @@ export function SlideDeck({
 // using the post-processing pipeline") so it works against whatever working
 // dir is active — the chat preface already says `[output dir: …]`.
 function ExportButton({
-  project,
+  apiBase,
   latestExport,
   exporting,
   canTrigger,
   onTrigger,
 }: {
-  project: string;
+  apiBase: string;
   latestExport: ExportMeta | null;
   exporting: boolean;
   canTrigger: boolean;
@@ -319,7 +324,7 @@ function ExportButton({
   if (latestExport) {
     return (
       <a
-        href={`/api/projects/${encodeURIComponent(project)}/export.pptx`}
+        href={`${apiBase}/export.pptx`}
         className="text-sm px-3 py-1 border border-brand-green text-brand-green rounded hover:bg-brand-green hover:text-white"
         title={`${latestExport.file} · ${(latestExport.bytes / 1024).toFixed(0)} KB`}
       >

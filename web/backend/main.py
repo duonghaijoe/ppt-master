@@ -1,8 +1,8 @@
 """FastAPI entry point.
 
-Run:
+Run via `web/dev.sh` (preferred — reads port from web/.env), or manually:
     cd web/backend
-    ../../.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8787 --reload
+    ../../.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port "${BACKEND_PORT:-8765}" --reload
 """
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from authz import (
 )
 import audit
 import billing
+import dev_auth
 import quotas
 import rate_limit
 import tenants
@@ -73,6 +74,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Dev-only login shim: enabled when PPT_DEV_AUTH=1, no-op otherwise.
+dev_auth.install(app)
 
 
 class CreateSessionBody(BaseModel):
@@ -597,6 +601,156 @@ def tenant_register_dir(slug: str, name: str, body: OutputDirsRegisterBody, _: U
         raise HTTPException(status_code=400, detail=str(e))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="project not found")
+
+
+@app.post("/api/tenants/{slug}/projects/{name}/output-dirs/current")
+def tenant_set_output_dirs_current(
+    slug: str, name: str, body: OutputDirsCurrentBody, _: User = Depends(require_project_role("editor"))
+):
+    if not project_path(name, slug).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    directive = read_output_dirs(name, slug)
+    target = body.current.strip("/")
+    if target not in {d["dir"] for d in directive["dirs"]}:
+        raise HTTPException(status_code=400, detail="dir not registered")
+    directive["current"] = target
+    return write_output_dirs(name, directive, slug)
+
+
+@app.get("/api/tenants/{slug}/projects/{name}/web/{path:path}")
+def tenant_project_web(slug: str, name: str, path: str, _: User = Depends(require_project_role("viewer"))):
+    if not project_path(name, slug).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        target = safe_rel(name, path, slug)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    if target.suffix.lower() == ".svg":
+        try:
+            body = inline_icons(target.read_text(encoding="utf-8"))
+        except Exception:
+            return FileResponse(target, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+        return Response(content=body, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+    return FileResponse(target, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/tenants/{slug}/projects/{name}/svg/{filename}")
+def tenant_serve_svg(slug: str, name: str, filename: str, _: User = Depends(require_project_role("viewer"))):
+    if not filename.endswith(".svg") or "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    path = project_path(name, slug) / "svg_output" / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="not found")
+    raw = path.read_text(encoding="utf-8")
+    try:
+        body = inline_icons(raw)
+    except Exception:
+        body = raw
+    return Response(
+        content=body,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/tenants/{slug}/projects/{name}/svg/{filename}")
+def tenant_save_svg(
+    slug: str, name: str, filename: str, body: SvgSaveBody, _: User = Depends(require_project_role("editor"))
+):
+    if not filename.endswith(".svg") or "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    folder = project_path(name, slug) / "svg_output"
+    target = folder / filename
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        target.resolve().relative_to(folder.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="path escape")
+    text = body.content
+    head = text.lstrip()[:200].lower()
+    if "<svg" not in head:
+        raise HTTPException(status_code=400, detail="not an SVG document")
+    try:
+        text = fold_icons(text)
+    except Exception:
+        pass
+    target.write_text(text, encoding="utf-8")
+    return {"ok": True, "bytes": len(text.encode("utf-8"))}
+
+
+@app.post("/api/tenants/{slug}/projects/{name}/svg-save")
+def tenant_save_svg_path(
+    slug: str, name: str, path: str, body: SvgSaveBody, _: User = Depends(require_project_role("editor"))
+):
+    if not project_path(name, slug).exists():
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        target = safe_rel(name, path, slug)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid path")
+    if target.suffix.lower() != ".svg":
+        raise HTTPException(status_code=400, detail="not an svg path")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    text = body.content
+    head = text.lstrip()[:200].lower()
+    if "<svg" not in head:
+        raise HTTPException(status_code=400, detail="not an SVG document")
+    try:
+        text = fold_icons(text)
+    except Exception:
+        pass
+    target.write_text(text, encoding="utf-8")
+    return {"ok": True, "bytes": len(text.encode("utf-8"))}
+
+
+@app.get("/api/tenants/{slug}/projects/{name}/images/{filename}")
+def tenant_serve_project_image(slug: str, name: str, filename: str, _: User = Depends(require_project_role("viewer"))):
+    if "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    path = project_path(name, slug) / "images" / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    media = _IMAGE_MEDIA.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(path, media_type=media, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/tenants/{slug}/projects/{name}/export.pptx")
+def tenant_serve_latest_pptx(slug: str, name: str, _: User = Depends(require_project_role("viewer"))):
+    items = list_exports(name, slug)
+    if not items:
+        raise HTTPException(status_code=404, detail="no exports")
+    path = project_path(name, slug) / "exports" / items[0]["file"]
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        filename=items[0]["file"],
+    )
+
+
+@app.get("/api/tenants/{slug}/projects/{name}/events")
+async def tenant_project_events(slug: str, name: str, _: User = Depends(require_project_role("viewer"))):
+    proj = project_path(name, slug)
+    if not proj.exists():
+        raise HTTPException(status_code=404, detail="project not found")
+
+    stop_event = asyncio.Event()
+
+    async def stream() -> AsyncIterator[bytes]:
+        try:
+            async for evt in watch_project(proj, stop_event):
+                yield f"data: {json.dumps(evt)}\n\n".encode("utf-8")
+        except asyncio.CancelledError:
+            stop_event.set()
+            raise
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
 
 
 # ─── Project sharing (Phase 8) ──────────────────────────────────────────────

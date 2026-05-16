@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { TenantSwitcher } from "./TenantSwitcher";
-import type { TenantSummary } from "../hooks/useTenants";
+import { AccountBadge } from "./LoginGate";
+import type { Me, TenantSummary } from "../hooks/useTenants";
 
 type PermissionMode = "auto" | "confirm";
 type Format = "ppt169" | "ppt43" | "a4portrait";
@@ -33,6 +34,8 @@ export function Dashboard({
   isOwnerOfActiveTenant,
   onSwitchTenant,
   onOpenTenantSettings,
+  me,
+  onLoggedOut,
   existing,
   permissionMode,
   onPermissionChange,
@@ -48,6 +51,8 @@ export function Dashboard({
   isOwnerOfActiveTenant: boolean;
   onSwitchTenant: (slug: string) => void;
   onOpenTenantSettings: () => void;
+  me: Me | null;
+  onLoggedOut: () => void;
   existing: ProjectMeta[];
   permissionMode: PermissionMode;
   onPermissionChange: (m: PermissionMode) => void;
@@ -143,7 +148,7 @@ export function Dashboard({
           </span>
         </div>
 
-        <div className="px-5 pb-3">
+        <div className="px-5 pb-3 flex items-center justify-between gap-3">
           {tenantsLoading ? (
             <div className="text-[11px] text-gray-400 italic">Loading workspaces…</div>
           ) : tenantsError ? (
@@ -155,6 +160,13 @@ export function Dashboard({
               onSelect={onSwitchTenant}
               onOpenSettings={onOpenTenantSettings}
               isOwnerOfActive={isOwnerOfActiveTenant}
+            />
+          )}
+          {me && (
+            <AccountBadge
+              email={me.email}
+              displayName={me.display_name}
+              onLoggedOut={onLoggedOut}
             />
           )}
         </div>

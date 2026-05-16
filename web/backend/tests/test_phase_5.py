@@ -507,7 +507,7 @@ def test_sandbox_bash_allows_local_image_route_curl(
         "Bash",
         {
             "command": (
-                "curl -sS -X POST http://127.0.0.1:8787/api/tenants/acme/projects/alpha/images/generate "
+                "curl -sS -X POST http://127.0.0.1:8765/api/tenants/acme/projects/alpha/images/generate "
                 "-H 'Content-Type: application/json' -d '{\"prompt\":\"x\"}'"
             )
         },

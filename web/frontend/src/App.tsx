@@ -5,6 +5,7 @@ import { Dashboard } from "./components/Dashboard";
 import { ProjectHeader, type ThreadEntry } from "./components/ProjectHeader";
 import { BillingDrawer } from "./components/BillingDrawer";
 import { TenantSettingsDrawer } from "./components/TenantSettingsDrawer";
+import { LoginGate } from "./components/LoginGate";
 import { SessionProvider } from "./SessionContext";
 import { useAgentStream } from "./hooks/useAgentStream";
 import { useTenants } from "./hooks/useTenants";
@@ -41,6 +42,7 @@ export function App() {
     isOwnerOfActive,
     loading: tenantsLoading,
     error: tenantsError,
+    unauthenticated,
     setActiveSlug,
     refresh: refreshTenants,
   } = useTenants();
@@ -274,6 +276,10 @@ export function App() {
     setActiveSlug(slug);
   }
 
+  if (unauthenticated) {
+    return <LoginGate onLoggedIn={refreshTenants} />;
+  }
+
   if (!session) {
     return (
       <>
@@ -285,6 +291,8 @@ export function App() {
           isOwnerOfActiveTenant={isOwnerOfActive}
           onSwitchTenant={switchTenant}
           onOpenTenantSettings={() => setTenantSettingsOpen(true)}
+          me={me}
+          onLoggedOut={refreshTenants}
           existing={existing}
           permissionMode={permissionMode}
           onPermissionChange={setPermissionMode}
@@ -430,6 +438,7 @@ function SessionShell({
             sessionId={session.session_id}
             permissionMode={session.permission_mode}
             modelTier={session.model_tier}
+            tenant={session.tenant_slug}
             currentProject={session.project}
             projects={projects}
             onChangeMode={onPermissionChange}
@@ -440,6 +449,7 @@ function SessionShell({
         </aside>
         <main className="overflow-hidden min-h-0 min-w-0">
           <PreviewPanel
+            tenant={session.tenant_slug}
             project={session.project}
             onAskAi={(text) => setComposeReq({ text, nonce: Date.now() })}
             onSendAi={(text) => setComposeReq({ text, nonce: Date.now(), autoSend: true })}

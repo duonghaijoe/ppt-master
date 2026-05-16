@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { FilePreview, ext } from "./FilePreview";
+import { projectApi } from "../api/projectUrls";
 
 type Entry = { name: string; is_dir: boolean; size: number | null; mtime: number };
 type Tree = { type: "dir"; path: string; entries: Entry[] };
@@ -25,12 +26,15 @@ function parentPath(p: string): string {
 }
 
 export function ProjectFiles({
+  tenant,
   project,
   onAskAi,
 }: {
+  tenant: string;
   project: string;
   onAskAi?: (text: string) => void;
 }) {
+  const apiBase = projectApi(tenant, project);
   const [path, setPath] = useState("");
   const [tree, setTree] = useState<Tree | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -39,18 +43,18 @@ export function ProjectFiles({
 
   useEffect(() => {
     setError(null);
-    fetch(`/api/projects/${encodeURIComponent(project)}/tree?path=${encodeURIComponent(path)}`)
+    fetch(`${apiBase}/tree?path=${encodeURIComponent(path)}`)
       .then(async (r) => {
         if (!r.ok) throw new Error(await r.text());
         return r.json();
       })
       .then((d: Tree) => setTree(d))
       .catch((e) => setError(String(e.message || e)));
-  }, [project, path, bust]);
+  }, [apiBase, path, bust]);
 
   // Watch fs to refresh listing.
   useEffect(() => {
-    const es = new EventSource(`/api/projects/${encodeURIComponent(project)}/events`);
+    const es = new EventSource(`${apiBase}/events`);
     let pending: number | null = null;
     es.onmessage = () => {
       if (pending) return;
@@ -63,7 +67,7 @@ export function ProjectFiles({
       es.close();
       if (pending) window.clearTimeout(pending);
     };
-  }, [project]);
+  }, [apiBase]);
 
   const crumbs = useMemo(() => {
     const parts = path ? path.split("/") : [];
@@ -169,7 +173,7 @@ export function ProjectFiles({
       {/* Right: preview */}
       <div className="flex-1 min-h-0 overflow-auto bg-gray-50">
         {selected ? (
-          <FilePreview project={project} path={selected} version={bust} onAskAi={onAskAi} />
+          <FilePreview tenant={tenant} project={project} path={selected} version={bust} onAskAi={onAskAi} />
         ) : (
           <div className="h-full flex items-center justify-center text-sm text-gray-400 p-6 text-center">
             Select a file to preview

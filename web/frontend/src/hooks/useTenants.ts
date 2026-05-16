@@ -10,9 +10,12 @@ export type TenantSummary = {
 };
 
 export type Me = {
-  user: { id: string; email: string; display_name: string };
+  id: string;
+  email: string;
+  display_name: string;
   platform_admin: boolean;
   memberships: { tenant_slug: string; role: TenantRole }[];
+  created_at?: number;
 };
 
 const ACTIVE_TENANT_KEY = "awesomedeck.activeTenant";
@@ -30,21 +33,28 @@ export function useTenants() {
   const [activeSlug, setActiveSlugState] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [unauthenticated, setUnauthenticated] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [meRes, tenantsRes] = await Promise.all([
-        fetch("/api/me"),
-        fetch("/api/tenants"),
-      ]);
+      const meRes = await fetch("/api/me");
+      if (meRes.status === 401) {
+        setMe(null);
+        setTenants([]);
+        setActiveSlugState(null);
+        setUnauthenticated(true);
+        return;
+      }
       if (!meRes.ok) throw new Error(`/api/me ${meRes.status}`);
+      const tenantsRes = await fetch("/api/tenants");
       if (!tenantsRes.ok) throw new Error(`/api/tenants ${tenantsRes.status}`);
       const meData = (await meRes.json()) as Me;
       const tenantsData = (await tenantsRes.json()) as { tenants: TenantSummary[] };
       setMe(meData);
       setTenants(tenantsData.tenants ?? []);
+      setUnauthenticated(false);
 
       const stored = localStorage.getItem(ACTIVE_TENANT_KEY);
       const available = (tenantsData.tenants ?? []).map((t) => t.slug);
@@ -82,6 +92,7 @@ export function useTenants() {
     isOwnerOfActive,
     loading,
     error,
+    unauthenticated,
     setActiveSlug,
     refresh,
   };

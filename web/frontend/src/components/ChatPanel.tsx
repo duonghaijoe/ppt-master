@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useSession } from "../SessionContext";
 import type { AgentEvent } from "../hooks/useAgentStream";
+import { projectApi } from "../api/projectUrls";
 
 type Upload = {
   key: string;
@@ -31,6 +32,7 @@ type Props = {
   sessionId: string;
   permissionMode: PermissionMode;
   modelTier: ModelTier;
+  tenant: string;
   currentProject: string;
   projects: ProjectRef[];
   onChangeMode: (m: PermissionMode) => void;
@@ -52,6 +54,7 @@ export function ChatPanel({
   sessionId,
   permissionMode,
   modelTier,
+  tenant,
   currentProject,
   projects,
   onChangeMode,
@@ -312,7 +315,7 @@ export function ChatPanel({
     // still wins. Best-effort; if the directive 404s we just send without it.
     try {
       const res = await fetch(
-        `/api/projects/${encodeURIComponent(currentProject)}/output-dirs`,
+        `${projectApi(tenant, currentProject)}/output-dirs`,
       );
       if (res.ok) {
         const data = await res.json();

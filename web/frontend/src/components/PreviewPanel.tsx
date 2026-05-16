@@ -5,10 +5,12 @@ import { ProjectFiles } from "./ProjectFiles";
 type Tab = "workbench" | "files";
 
 export function PreviewPanel({
+  tenant,
   project,
   onAskAi,
   onSendAi,
 }: {
+  tenant: string;
   project: string;
   onAskAi?: (text: string) => void;
   // Dispatch a chat message immediately, bypassing the textarea. Used by the
@@ -32,9 +34,9 @@ export function PreviewPanel({
       </div>
       <div className="flex-1 min-h-0">
         {tab === "workbench" ? (
-          <Workbench project={project} onAskAi={onAskAi} onSendAi={onSendAi} />
+          <Workbench tenant={tenant} project={project} onAskAi={onAskAi} onSendAi={onSendAi} />
         ) : (
-          <ProjectFiles project={project} onAskAi={onAskAi} />
+          <ProjectFiles tenant={tenant} project={project} onAskAi={onAskAi} />
         )}
       </div>
     </div>
