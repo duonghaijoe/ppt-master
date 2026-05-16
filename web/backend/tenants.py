@@ -360,6 +360,194 @@ def remove_member(slug: str, user_id: str) -> None:
     users.remove_membership(user_id, slug)
 
 
+# ─── Design system ──────────────────────────────────────────────────────────
+# tenants/<slug>/design_system/{palette.json, typography.json, spec.md}
+#
+# Read by the agent (so generated decks pick up the tenant's brand without
+# re-discovery) and editable by tenant owners through the Settings page.
+# Stored as on-disk JSON/markdown so it's diffable and grep-able instead of
+# living in a DB row.
+
+
+def _design_system_dir(slug: str) -> Path:
+    return tenant_dir(slug) / "design_system"
+
+
+def read_design_system(slug: str) -> dict:
+    """Return ``{palette, typography, spec}`` for the tenant, defaulting empty.
+
+    Missing files are not an error — a freshly-created tenant has none until
+    the owner saves through the editor. The shape is stable so the frontend
+    can always render the form.
+    """
+    if not tenant_exists(slug):
+        raise FileNotFoundError(slug)
+    d = _design_system_dir(slug)
+    palette = _read_json(d / "palette.json") if d.exists() else None
+    typography = _read_json(d / "typography.json") if d.exists() else None
+    spec_path = d / "spec.md"
+    spec = ""
+    if spec_path.exists():
+        try:
+            spec = spec_path.read_text(encoding="utf-8")
+        except Exception:
+            spec = ""
+    return {
+        "palette": palette if isinstance(palette, dict) else {},
+        "typography": typography if isinstance(typography, dict) else {},
+        "spec": spec,
+    }
+
+
+def write_design_system(
+    slug: str,
+    *,
+    palette: dict | None = None,
+    typography: dict | None = None,
+    spec: str | None = None,
+) -> dict:
+    """Persist any provided slice of the design system; leaves others alone.
+
+    Validates that ``palette`` and ``typography`` are plain dicts so the
+    on-disk JSON stays parseable. Returns the merged read after the write so
+    callers see the canonical post-save state.
+    """
+    if not tenant_exists(slug):
+        raise FileNotFoundError(slug)
+    d = _design_system_dir(slug)
+    d.mkdir(parents=True, exist_ok=True)
+    if palette is not None:
+        if not isinstance(palette, dict):
+            raise ValueError("palette must be an object")
+        _write_json(d / "palette.json", palette)
+    if typography is not None:
+        if not isinstance(typography, dict):
+            raise ValueError("typography must be an object")
+        _write_json(d / "typography.json", typography)
+    if spec is not None:
+        if not isinstance(spec, str):
+            raise ValueError("spec must be a string")
+        # Atomic write — same approach as _write_json minus the JSON encode.
+        import os
+        body = spec
+        tmp = (d / "spec.md").with_suffix(".md.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, d / "spec.md")
+    return read_design_system(slug)
+
+
+# ─── Shared brand assets ────────────────────────────────────────────────────
+# tenants/<slug>/shared/ holds reusable logos, fonts, illustrations the tenant
+# wants available across all projects without re-uploading per deck.
+
+
+_MAX_SHARED_BYTES = 25 * 1024 * 1024  # 25 MB per file; aggressive enough to
+# keep the upload form honest but loose enough for vector logos + small fonts.
+
+_DENY_SHARED_EXT = {
+    ".exe", ".dll", ".so", ".bin", ".sh", ".bat", ".cmd",
+    ".js", ".mjs", ".cjs", ".html", ".htm", ".php", ".py",
+}
+
+
+def shared_dir(slug: str) -> Path:
+    return tenant_dir(slug) / "shared"
+
+
+def _safe_shared_rel(slug: str, rel: str) -> Path:
+    """Resolve a caller-supplied path under ``shared/``, refusing escape.
+
+    Accepts subpaths like ``logos/dark.png``. Rejects absolute paths, ``..``
+    segments, hidden segments, and anything that lands outside ``shared/``.
+    """
+    base = shared_dir(slug).resolve()
+    rel = (rel or "").strip().lstrip("/")
+    if not rel:
+        raise ValueError("path is required")
+    parts = Path(rel).parts
+    if any(p in {"", ".", ".."} or p.startswith(".") for p in parts):
+        raise ValueError("invalid path")
+    target = (base / rel).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        raise ValueError("path escape")
+    return target
+
+
+def list_shared(slug: str) -> list[dict]:
+    """List shared assets as ``{path, size, mtime, kind}`` tuples.
+
+    Walks the whole subtree (logos/, fonts/, etc.) so the UI can render a
+    flat picker; the path key carries the subdirectory.
+    """
+    if not tenant_exists(slug):
+        raise FileNotFoundError(slug)
+    base = shared_dir(slug)
+    if not base.exists():
+        return []
+    out: list[dict] = []
+    for p in sorted(base.rglob("*")):
+        if not p.is_file() or p.name.startswith("."):
+            continue
+        rel = p.relative_to(base).as_posix()
+        out.append({
+            "path": rel,
+            "size": p.stat().st_size,
+            "mtime": int(p.stat().st_mtime),
+            "kind": p.suffix.lstrip(".").lower(),
+        })
+    return out
+
+
+def save_shared_asset(slug: str, rel: str, blob: bytes) -> dict:
+    """Write a single shared asset, refusing extension blacklist + oversize.
+
+    The caller passes the destination path (e.g. ``logos/dark.png``); the
+    server validates it is inside ``shared/`` and the extension isn't on the
+    denylist (executable / scripty types — we serve these to browsers).
+    """
+    if not tenant_exists(slug):
+        raise FileNotFoundError(slug)
+    target = _safe_shared_rel(slug, rel)
+    if target.suffix.lower() in _DENY_SHARED_EXT:
+        raise ValueError(f"file type {target.suffix!r} is not allowed in shared/")
+    if len(blob) > _MAX_SHARED_BYTES:
+        raise ValueError(f"file exceeds {_MAX_SHARED_BYTES} bytes")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    import os
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    with open(tmp, "wb") as f:
+        f.write(blob)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, target)
+    return {
+        "path": rel.lstrip("/"),
+        "size": target.stat().st_size,
+        "mtime": int(target.stat().st_mtime),
+        "kind": target.suffix.lstrip(".").lower(),
+    }
+
+
+def delete_shared_asset(slug: str, rel: str) -> None:
+    if not tenant_exists(slug):
+        raise FileNotFoundError(slug)
+    target = _safe_shared_rel(slug, rel)
+    if not target.exists() or not target.is_file():
+        raise FileNotFoundError(rel)
+    target.unlink()
+    # Prune empty parent directories, but stop at shared/ itself.
+    parent = target.parent
+    base = shared_dir(slug).resolve()
+    while parent != base and parent.exists() and not any(parent.iterdir()):
+        parent.rmdir()
+        parent = parent.parent
+
+
 def list_for_user(user: User) -> list[dict]:
     """Tenants the user can see, with their role per tenant.
 

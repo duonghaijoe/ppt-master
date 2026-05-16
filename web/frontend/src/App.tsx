@@ -4,8 +4,10 @@ import { PreviewPanel } from "./components/PreviewPanel";
 import { Dashboard } from "./components/Dashboard";
 import { ProjectHeader, type ThreadEntry } from "./components/ProjectHeader";
 import { BillingDrawer } from "./components/BillingDrawer";
+import { TenantSettingsDrawer } from "./components/TenantSettingsDrawer";
 import { SessionProvider } from "./SessionContext";
 import { useAgentStream } from "./hooks/useAgentStream";
+import { useTenants } from "./hooks/useTenants";
 import {
   deriveTitle,
   loadThreadEvents,
@@ -31,32 +33,53 @@ type SessionInfo = {
 type ProjectMeta = { name: string; slides: number; exports?: number; mtime?: number };
 
 export function App() {
+  const {
+    tenants,
+    activeSlug,
+    activeTenant,
+    isOwnerOfActive,
+    loading: tenantsLoading,
+    error: tenantsError,
+    setActiveSlug,
+    refresh: refreshTenants,
+  } = useTenants();
+
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [existing, setExisting] = useState<ProjectMeta[]>([]);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("auto");
   const [modelTier, setModelTier] = useState<ModelTier>("auto");
+  const [tenantSettingsOpen, setTenantSettingsOpen] = useState(false);
 
   // Thread state — only meaningful while a session is active.
   const [threadId, setThreadId] = useState<string | null>(null);
   const [threads, setThreads] = useState<ThreadEntry[]>([]);
   const [hydrated, setHydrated] = useState<{ events: ReturnType<typeof loadThreadEvents>; nonce: number } | null>(null);
 
-  // Refresh project list whenever the dashboard mounts AND whenever a session
-  // opens (so the in-chat "reference another project" picker stays fresh).
+  // Refresh project list whenever the active tenant changes AND whenever a
+  // session opens (so the in-chat "reference another project" picker stays
+  // fresh). Skipped while we're still resolving the active tenant.
   useEffect(() => {
-    fetch("/api/projects")
+    if (!activeSlug) {
+      setExisting([]);
+      return;
+    }
+    fetch(`/api/tenants/${activeSlug}/projects`)
       .then((r) => r.json())
       .then((d) => setExisting(d.projects ?? []))
       .catch(() => setExisting([]));
-  }, [session?.project]);
+  }, [activeSlug, session?.project]);
 
   async function createProject(name: string, format: Format) {
+    if (!activeSlug) {
+      setError("No active tenant — pick one first.");
+      return;
+    }
     setCreating(true);
     setError(null);
     try {
-      const res = await fetch("/api/sessions", {
+      const res = await fetch(`/api/tenants/${activeSlug}/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -71,7 +94,7 @@ export function App() {
       enterSession({
         session_id: data.session_id,
         project: data.project,
-        tenant_slug: data.tenant_slug ?? "default",
+        tenant_slug: data.tenant_slug ?? activeSlug,
         permission_mode: data.permission_mode ?? permissionMode,
         model_tier: data.model_tier ?? modelTier,
       });
@@ -83,9 +106,13 @@ export function App() {
   }
 
   async function attach(name: string) {
+    if (!activeSlug) {
+      setError("No active tenant — pick one first.");
+      return;
+    }
     setError(null);
     try {
-      const res = await fetch("/api/sessions/attach", {
+      const res = await fetch(`/api/tenants/${activeSlug}/sessions/attach`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -99,7 +126,7 @@ export function App() {
       enterSession({
         session_id: data.session_id,
         project: data.project,
-        tenant_slug: data.tenant_slug ?? "default",
+        tenant_slug: data.tenant_slug ?? activeSlug,
         permission_mode: data.permission_mode ?? permissionMode,
         model_tier: data.model_tier ?? modelTier,
       });
@@ -166,7 +193,7 @@ export function App() {
     if (!session) return;
     const projectName = session.project;
     try {
-      const res = await fetch("/api/sessions/attach", {
+      const res = await fetch(`/api/tenants/${session.tenant_slug}/sessions/attach`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -204,7 +231,7 @@ export function App() {
     if (!session) return;
     if (id === threadId) return;
     try {
-      const res = await fetch("/api/sessions/attach", {
+      const res = await fetch(`/api/tenants/${session.tenant_slug}/sessions/attach`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -237,17 +264,47 @@ export function App() {
     setHydrated(null);
   }
 
+  function switchTenant(slug: string) {
+    if (slug === activeSlug) return;
+    // Switching tenants invalidates the in-flight session: the dashboard and
+    // sidebar projects are bound to the previously active tenant, so we drop
+    // the session and let the user start fresh inside the new workspace.
+    exitSession();
+    setActiveSlug(slug);
+  }
+
   if (!session) {
     return (
-      <Dashboard
-        existing={existing}
-        permissionMode={permissionMode}
-        onPermissionChange={setPermissionMode}
-        onCreate={createProject}
-        onOpen={attach}
-        creating={creating}
-        error={error}
-      />
+      <>
+        <Dashboard
+          activeSlug={activeSlug}
+          tenants={tenants}
+          tenantsLoading={tenantsLoading}
+          tenantsError={tenantsError}
+          isOwnerOfActiveTenant={isOwnerOfActive}
+          onSwitchTenant={switchTenant}
+          onOpenTenantSettings={() => setTenantSettingsOpen(true)}
+          existing={existing}
+          permissionMode={permissionMode}
+          onPermissionChange={setPermissionMode}
+          onCreate={createProject}
+          onOpen={attach}
+          creating={creating}
+          error={error}
+        />
+        {activeSlug && activeTenant && (
+          <TenantSettingsDrawer
+            tenantSlug={activeSlug}
+            tenantName={activeTenant.name}
+            isOwner={isOwnerOfActive}
+            open={tenantSettingsOpen}
+            onClose={() => {
+              setTenantSettingsOpen(false);
+              refreshTenants();
+            }}
+          />
+        )}
+      </>
     );
   }
 

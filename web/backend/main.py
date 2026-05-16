@@ -156,6 +156,18 @@ class UpdateMemberBody(BaseModel):
     role: str
 
 
+class DesignSystemBody(BaseModel):
+    palette: dict | None = None
+    typography: dict | None = None
+    spec: str | None = None
+
+
+class CreateProjectFromTemplateBody(BaseModel):
+    template: str
+    project_name: str
+    format: str | None = None
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True, "repo_root": str(REPO_ROOT)}
@@ -286,6 +298,102 @@ def members_remove(slug: str, user_id: str, _: User = Depends(require_tenant_rol
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"removed": user_id}
+
+
+# ─── Design system (tenant-wide brand tokens) ──────────────────────────────
+# Read: any member. Write: owner only. The agent picks these up via the
+# tenant directory layout — it doesn't go through the HTTP API to read them.
+
+@app.get("/api/tenants/{slug}/design-system")
+def design_system_get(slug: str, _: User = Depends(require_tenant_role("viewer"))):
+    try:
+        return tenants.read_design_system(slug)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="tenant not found")
+
+
+@app.put("/api/tenants/{slug}/design-system")
+def design_system_put(
+    slug: str,
+    body: DesignSystemBody,
+    _: User = Depends(require_tenant_role("owner")),
+):
+    try:
+        return tenants.write_design_system(
+            slug,
+            palette=body.palette,
+            typography=body.typography,
+            spec=body.spec,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="tenant not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ─── Shared brand assets (logos, fonts, illustrations) ─────────────────────
+
+@app.get("/api/tenants/{slug}/shared")
+def shared_list(slug: str, _: User = Depends(require_tenant_role("viewer"))):
+    try:
+        return {"assets": tenants.list_shared(slug)}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="tenant not found")
+
+
+@app.post("/api/tenants/{slug}/shared")
+async def shared_upload(
+    slug: str,
+    file: UploadFile = File(...),
+    path: str = Form(...),
+    _: User = Depends(require_tenant_role("editor")),
+):
+    """Multipart upload: `path` selects the destination key under shared/.
+
+    Example: ``path=logos/dark.png`` → ``tenants/<slug>/shared/logos/dark.png``.
+    Refuses path escape, hidden segments, and a denylist of executable
+    extensions. Single-file upload — clients chain calls for bulk imports.
+    """
+    body = await file.read()
+    try:
+        return tenants.save_shared_asset(slug, path, body)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="tenant not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/tenants/{slug}/shared")
+def shared_delete(
+    slug: str,
+    path: str,
+    _: User = Depends(require_tenant_role("editor")),
+):
+    try:
+        tenants.delete_shared_asset(slug, path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"not found: {path}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"deleted": path}
+
+
+@app.get("/api/tenants/{slug}/shared/file")
+def shared_file_get(
+    slug: str,
+    path: str,
+    _: User = Depends(require_tenant_role("viewer")),
+):
+    """Serve a single shared asset — used by the UI preview thumbnails."""
+    try:
+        target = tenants._safe_shared_rel(slug, path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not tenants.tenant_exists(slug):
+        raise HTTPException(status_code=404, detail="tenant not found")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(target, headers={"Cache-Control": "no-store"})
 
 
 # ─── Tenant-prefixed project routes ─────────────────────────────────────────
@@ -711,6 +819,54 @@ def tenant_templates_delete(slug: str, name: str, _: User = Depends(require_tena
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"deleted": name}
+
+
+@app.get("/api/tenants/{slug}/templates/{name}/file")
+def tenant_template_file(
+    slug: str,
+    name: str,
+    path: str,
+    _: User = Depends(require_tenant_role("viewer")),
+):
+    """Stream a file inside a tenant's template (thumbnail, SKILL.md, design_spec.md, …)."""
+    try:
+        target = template_file_path(name, path, slug)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="template not found")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    if target.suffix.lower() == ".svg":
+        try:
+            body = inline_icons(target.read_text(encoding="utf-8"))
+        except Exception:
+            return FileResponse(target, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+        return Response(content=body, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+    return FileResponse(target, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/tenants/{slug}/projects/from-template")
+def tenant_create_project_from_template(
+    slug: str,
+    body: CreateProjectFromTemplateBody,
+    _: User = Depends(require_tenant_role("editor")),
+):
+    """Materialize a new project under the tenant from one of its templates."""
+    try:
+        project_dir = create_project_from_template(
+            body.template, body.project_name, body.format, slug
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="template not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "tenant": slug,
+        "project": project_dir.name,
+        "template": body.template,
+        "format": body.format or "",
+    }
 
 
 # ----------------------------------------------------------------------
