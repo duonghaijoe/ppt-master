@@ -7,7 +7,20 @@ export type AgentEvent =
   | { type: "permission_request"; id: string; tool: string; input: unknown; resolved?: "approve" | "deny" }
   | { type: "error"; message: string }
   | { type: "done" }
-  | { type: "raw"; repr: string };
+  | { type: "raw"; repr: string }
+  | {
+      type: "billing.threshold";
+      tenant: string;
+      mtd_billed_usd: string;
+      cap_soft_usd: string;
+      threshold_fraction: number;
+    }
+  | {
+      type: "billing.cap_exceeded";
+      tenant: string;
+      mtd_billed_usd: string;
+      cap_hard_usd: string;
+    };
 
 export function useAgentStream(sessionId: string) {
   const [events, setEvents] = useState<AgentEvent[]>([]);
@@ -51,6 +64,33 @@ export function useAgentStream(sessionId: string) {
           body: JSON.stringify({ text }),
           signal: ctrl.signal,
         });
+        // 402 from check_eligibility / per-session ceiling — surface as a
+        // billing event so the chat banners pick it up instead of a generic error.
+        if (res.status === 402) {
+          try {
+            const body = await res.json();
+            const detail = body?.detail ?? body ?? {};
+            setEvents((prev) => [
+              ...prev,
+              {
+                type: "billing.cap_exceeded",
+                tenant: detail.tenant ?? "",
+                mtd_billed_usd: detail.mtd_billed_usd ?? "0",
+                cap_hard_usd: detail.cap_hard_usd ?? detail.session_ceiling_usd ?? "0",
+              },
+            ]);
+          } catch {
+            setEvents((prev) => [
+              ...prev,
+              { type: "error", message: "billing_blocked (402)" },
+            ]);
+          }
+          return;
+        }
+        if (!res.ok) {
+          const msg = await res.text().catch(() => "");
+          throw new Error(msg || `HTTP ${res.status}`);
+        }
         if (!res.body) throw new Error("no response body");
         const reader = res.body.getReader();
         const decoder = new TextDecoder();

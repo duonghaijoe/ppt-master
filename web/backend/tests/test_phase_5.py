@@ -98,6 +98,8 @@ def isolated_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(metering, "BILLING_DB", billing_db)
     monkeypatch.setattr(metering, "PRICING_FILE", pricing_file)
 
+    import time as _time
+    now_ts = int(_time.time())
     for slug, name in [("default", "Default"), ("acme", "Acme Co")]:
         td = tenants_dir / slug
         td.mkdir()
@@ -107,7 +109,7 @@ def isolated_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                 "name": name,
                 "owner_user_id": f"u-{slug}-owner",
                 "default_format": "ppt169",
-                "created_at": 1700000000,
+                "created_at": now_ts,
             }),
             encoding="utf-8",
         )

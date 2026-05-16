@@ -3,6 +3,7 @@ import { ChatPanel } from "./components/ChatPanel";
 import { PreviewPanel } from "./components/PreviewPanel";
 import { Dashboard } from "./components/Dashboard";
 import { ProjectHeader, type ThreadEntry } from "./components/ProjectHeader";
+import { BillingDrawer } from "./components/BillingDrawer";
 import { SessionProvider } from "./SessionContext";
 import { useAgentStream } from "./hooks/useAgentStream";
 import {
@@ -22,6 +23,7 @@ type Format = "ppt169" | "ppt43" | "a4portrait";
 type SessionInfo = {
   session_id: string;
   project: string;
+  tenant_slug: string;
   permission_mode: PermissionMode;
   model_tier: ModelTier;
 };
@@ -69,6 +71,7 @@ export function App() {
       enterSession({
         session_id: data.session_id,
         project: data.project,
+        tenant_slug: data.tenant_slug ?? "default",
         permission_mode: data.permission_mode ?? permissionMode,
         model_tier: data.model_tier ?? modelTier,
       });
@@ -96,6 +99,7 @@ export function App() {
       enterSession({
         session_id: data.session_id,
         project: data.project,
+        tenant_slug: data.tenant_slug ?? "default",
         permission_mode: data.permission_mode ?? permissionMode,
         model_tier: data.model_tier ?? modelTier,
       });
@@ -187,6 +191,7 @@ export function App() {
       setSession({
         session_id: data.session_id,
         project: data.project,
+        tenant_slug: data.tenant_slug ?? "default",
         permission_mode: data.permission_mode ?? permissionMode,
         model_tier: data.model_tier ?? modelTier,
       });
@@ -216,6 +221,7 @@ export function App() {
       setSession({
         session_id: data.session_id,
         project: data.project,
+        tenant_slug: data.tenant_slug ?? "default",
         permission_mode: data.permission_mode ?? permissionMode,
         model_tier: data.model_tier ?? modelTier,
       });
@@ -305,6 +311,7 @@ function SessionShell({
 }) {
   const stream = useAgentStream(session.session_id);
   const seededRef = useRef(false);
+  const [billingOpen, setBillingOpen] = useState(false);
   // SVG-editor → chat handoff. SlideEditor builds a context-rich draft when
   // the user hits "Ask AI" on a selected element; ChatPanel watches the nonce
   // and refills its textarea so the user can review and send.
@@ -344,6 +351,7 @@ function SessionShell({
             onNewChat={onNewChat}
             onSelectThread={onSelectThread}
             onPermissionChange={onPermissionChange}
+            onOpenBilling={() => setBillingOpen(true)}
           />
           <ChatPanel
             sessionId={session.session_id}
@@ -365,6 +373,11 @@ function SessionShell({
           />
         </main>
       </div>
+      <BillingDrawer
+        tenantSlug={session.tenant_slug}
+        open={billingOpen}
+        onClose={() => setBillingOpen(false)}
+      />
     </SessionProvider>
   );
 }

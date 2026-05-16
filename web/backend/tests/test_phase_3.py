@@ -51,8 +51,22 @@ def isolated_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     users_dir = tmp_path / "users"
     tenants_dir = tmp_path / "tenants"
     platform_file = tmp_path / ".platform.json"
+    platform_dir = tmp_path / "platform"
+    billing_db = platform_dir / "billing.db"
+    pricing_file = platform_dir / "pricing.json"
     users_dir.mkdir()
     tenants_dir.mkdir()
+    platform_dir.mkdir()
+    # Minimal pricing so the eligibility math is deterministic.
+    pricing_file.write_text(
+        json.dumps({"version": "phase3-test", "margin": 0.2, "providers": {}}),
+        encoding="utf-8",
+    )
+
+    import metering as metering_mod
+    monkeypatch.setattr(metering_mod, "PLATFORM_DIR", platform_dir)
+    monkeypatch.setattr(metering_mod, "BILLING_DB", billing_db)
+    monkeypatch.setattr(metering_mod, "PRICING_FILE", pricing_file)
 
     # Patch every module-level copy of the storage roots. tenants.py,
     # users.py, templates.py and files.py each cache their own reference, so
@@ -80,7 +94,11 @@ def isolated_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         templates_mod, "PROJECTS_DIR", tenants_dir / "default" / "projects"
     )
 
-    # Seed tenants on disk.
+    # Seed tenants on disk. Use a recent creation time so trial credit
+    # (90d window) is still in-force and billing.check_eligibility() lets
+    # session-create proceed in the phase-3 RBAC matrix.
+    import time as _time
+    now = int(_time.time())
     for slug, name in [("acme", "Acme Co"), ("globex", "Globex Inc"), ("default", "Default")]:
         td = tenants_dir / slug
         td.mkdir()
@@ -90,7 +108,7 @@ def isolated_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                 "name": name,
                 "owner_user_id": f"u-{slug}-owner",
                 "default_format": "ppt169",
-                "created_at": 1700000000,
+                "created_at": now,
             }),
             encoding="utf-8",
         )

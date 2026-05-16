@@ -37,10 +37,22 @@ def isolated_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     users_dir = tmp_path / "users"
     tenants_dir = tmp_path / "tenants"
     platform_file = tmp_path / ".platform.json"
-    platform_skills_dir = tmp_path / "platform" / "skills"
+    platform_dir = tmp_path / "platform"
+    platform_skills_dir = platform_dir / "skills"
+    billing_db = platform_dir / "billing.db"
+    pricing_file = platform_dir / "pricing.json"
     users_dir.mkdir()
     tenants_dir.mkdir()
     platform_skills_dir.mkdir(parents=True)
+    pricing_file.write_text(
+        json.dumps({"version": "phase4-test", "margin": 0.2, "providers": {}}),
+        encoding="utf-8",
+    )
+
+    import metering as metering_mod
+    monkeypatch.setattr(metering_mod, "PLATFORM_DIR", platform_dir)
+    monkeypatch.setattr(metering_mod, "BILLING_DB", billing_db)
+    monkeypatch.setattr(metering_mod, "PRICING_FILE", pricing_file)
 
     monkeypatch.setattr(users_mod, "USERS_DIR", users_dir)
     monkeypatch.setattr(users_mod, "PLATFORM_FILE", platform_file)
@@ -59,6 +71,8 @@ def isolated_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
     # Default tenant + an acme tenant so we can confirm cross-tenant reads of
     # platform/skills/ still go through (skill content is platform-scope).
+    import time as _time
+    now_ts = int(_time.time())
     for slug, name in [("default", "Default"), ("acme", "Acme Co")]:
         td = tenants_dir / slug
         td.mkdir()
@@ -68,7 +82,7 @@ def isolated_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                 "name": name,
                 "owner_user_id": f"u-{slug}-owner",
                 "default_format": "ppt169",
-                "created_at": 1700000000,
+                "created_at": now_ts,
             }),
             encoding="utf-8",
         )
